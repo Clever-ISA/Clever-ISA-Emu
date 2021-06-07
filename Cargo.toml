@@ -1,0 +1,19 @@
+[package]
+name = "clever-isa-emu"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+fp = []
+# decimal-fp = ["fp","decimal"]
+simd = [] # TODO, this is not defined by the ISA Spec
+
+[dependencies]
+bytemuck = {git="https://github.com/Lokathor/bytemuck",features=["derive","min_const_generics"]}
+parking_lot = "0.11.1"
+fake-enum = "0.1.2"
+tearor = "0.1.0"
+cached = "0.23.0"
+bitflags = "1.2.1"
