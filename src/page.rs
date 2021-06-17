@@ -26,7 +26,7 @@ impl PageEntry {
         PageFlags::from_bits_truncate(self.0 & 0xfff)
     }
 
-    pub fn get_value(&self) -> u64 {
+    pub fn value(&self) -> u64 {
         self.0 & !0xfff
     }
 
@@ -36,7 +36,7 @@ impl PageEntry {
             return Err(CPUException::PageFault(
                 vaddr,
                 FaultCharacteristics {
-                    pref: self.get_value() as i64,
+                    pref: self.value() as i64,
                     flevel: level,
                     access_kind: access,
                     ..Zeroable::zeroed()
@@ -44,8 +44,10 @@ impl PageEntry {
             ));
         }
         if !match access {
-            AccessKind::Write => flags.contains(PageFlags::WRITABLE | PageFlags::PRESENT),
-            AccessKind::Execute => {
+            AccessKind::Write if level == 0 => {
+                flags.contains(PageFlags::WRITABLE | PageFlags::PRESENT)
+            }
+            AccessKind::Execute if level == 0 => {
                 flags.contains(PageFlags::PRESENT) && !flags.contains(PageFlags::NX)
             }
             _ => flags.contains(PageFlags::PRESENT),
@@ -53,7 +55,7 @@ impl PageEntry {
             Err(CPUException::PageFault(
                 vaddr,
                 FaultCharacteristics {
-                    pref: self.get_value() as i64,
+                    pref: self.value() as i64,
                     flevel: level,
                     access_kind: access,
                     ..Zeroable::zeroed()

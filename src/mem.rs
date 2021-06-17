@@ -1,237 +1,169 @@
-use std::{alloc::Layout, collections::HashMap, convert::TryInto, ptr::NonNull};
-
-use parking_lot::{
-    const_rwlock, lock_api::RawRwLockRecursive, RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard,
+use std::{
+    alloc::Layout,
+    collections::HashMap,
+    ops::{Deref, DerefMut},
 };
-use tearor::TearCell;
 
 use bytemuck::{Pod, Zeroable};
 
+use parking_lot::{RwLock, RwLockUpgradableReadGuard};
+
 use crate::error::{AccessKind, CPUException, CPUResult, FaultCharacteristics};
 
-pub struct MemController {
-    htab: RwLock<HashMap<u32, NonNull<[TearCell<u64>; 512]>>>,
+#[repr(C, align(4096))]
+#[derive(Copy, Clone, Hash, Zeroable, Pod)]
+pub struct Page(pub [u8; 4096]);
+
+pub struct MemoryController {
+    mem: RwLock<HashMap<u32, Box<Page>>>,
 }
 
-impl MemController {
-    unsafe fn allocate(
-        guard: RwLockUpgradableReadGuard<HashMap<u32, NonNull<[TearCell<u64>; 512]>>>,
-        pg: u32,
-    ) -> CPUResult<RwLockUpgradableReadGuard<HashMap<u32, NonNull<[TearCell<u64>; 512]>>>> {
-        let mut guard = RwLockUpgradableReadGuard::upgrade(guard);
-        if guard.get(&pg).is_none() {
-            let block = std::alloc::alloc_zeroed(
-                Layout::new::<[TearCell<u64>; 512]>()
-                    .align_to(4096)
-                    .unwrap(),
-            )
-            .cast::<[TearCell<u64>; 512]>();
+impl MemoryController {
+    fn allocate(htab: &mut HashMap<u32, Box<Page>>, page: u32) -> CPUResult<()> {
+        // SAFETY: size_of::<Page>()==4096
+        let ptr = unsafe { std::alloc::alloc_zeroed(Layout::new::<Page>()) };
 
-            if let Some(b) = NonNull::new(block) {
-                guard.insert(pg, b);
-            } else {
-                return Err(CPUException::PageFault(
-                    (pg as i64) << 12,
-                    FaultCharacteristics {
-                        pref: (pg as i64) << 12,
-                        flevel: 0,
-                        access_kind: AccessKind::Access,
-                        ..Zeroable::zeroed()
-                    },
-                ));
-            }
-        }
-        Ok(RwLockWriteGuard::downgrade_to_upgradable(guard))
-    }
-
-    pub fn new() -> MemController {
-        MemController {
-            htab: RwLock::new(HashMap::new()),
-        }
-    }
-
-    pub fn read_bytes(&self, paddr: u64, mut out: &mut [u8]) -> CPUResult<()> {
-        if paddr > (u32::MAX as u64) {
-            return Err(CPUException::PageFault(
-                paddr as i64,
+        if ptr.is_null() {
+            Err(CPUException::PageFault(
+                (page as i64) << 12,
                 FaultCharacteristics {
-                    pref: (paddr as i64) & !0xfff,
+                    pref: (page as i64) << 12,
                     flevel: 0,
-                    access_kind: AccessKind::Access,
+                    access_kind: AccessKind::Allocate,
                     ..Zeroable::zeroed()
                 },
-            ));
-        }
-
-        let page = (paddr >> 12) as u32;
-        let idx_in_page = (paddr & 0xfff) as usize >> 3;
-        let off = (paddr & 0x7) as usize;
-        let htab = self.htab.upgradable_read();
-        if let Some(&b) = htab.get(&page) {
-            let bytes = &unsafe { b.as_ref() }[idx_in_page..];
-            let len = if out.len() & 0x7 != 0 {
-                out.len() >> 3 + 1
-            } else {
-                out.len() >> 3
-            };
-            if let Some(mut bytes) = bytes.get(..len) {
-                if out.len() < (8 - off) & 0x7 {
-                    let val = bytes[0].load() >> off;
-                    out.copy_from_slice(&val.to_le_bytes()[..out.len()]);
-                    out = &mut [];
-                } else if off != 0 {
-                    let val = bytes[0].load() >> off;
-                    out.copy_from_slice(&val.to_le_bytes()[..(8 - off)]);
-                    out = &mut out[(8 - off)..];
-                }
-                while out.len() != 0 {
-                    if out.len() < 8 {
-                        let val = bytes[0].load();
-                        out.copy_from_slice(&val.to_le_bytes()[..out.len()]);
-                        out = &mut [];
-                    } else {
-                        let val = bytes[0].load();
-                        bytes = &bytes[1..];
-                        out[..8].copy_from_slice(&val.to_le_bytes());
-                        out = &mut out[8..];
-                    }
-                }
-            } else {
-                let len = bytes.len() << 3;
-                drop(bytes);
-                drop(htab);
-                self.read_bytes(paddr, &mut out[..len])?;
-                self.read_bytes((paddr & !0xfff) + 0x1000, &mut out[len..])?;
-            }
+            ))
         } else {
-            let _ = unsafe { MemController::allocate(htab, page)? }; // Drop
-            self.read_bytes(paddr, out)?;
-        }
+            // SAFETY: Page is allocated using the global allocator above
+            // ptr is not null be by the above check
+            // and ptr is not used after this point
+            let ptr = unsafe { Box::from_raw(ptr as *mut Page) };
 
-        Ok(())
+            htab.insert(page, ptr);
+            Ok(())
+        }
     }
 
-    pub fn write_bytes(&self, paddr: u64, mut in_bytes: &[u8]) -> CPUResult<()> {
+    pub fn new() -> Self {
+        Self {
+            mem: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn read_bytes(&self, mut out: &mut [u8], paddr: u64) -> CPUResult<()> {
         if paddr > (u32::MAX as u64) {
-            return Err(CPUException::PageFault(
+            Err(CPUException::PageFault(
                 paddr as i64,
                 FaultCharacteristics {
-                    pref: (paddr as i64) & !0xfff,
+                    pref: paddr as i64,
                     flevel: 0,
-                    access_kind: AccessKind::Access,
+                    access_kind: AccessKind::Allocate,
                     ..Zeroable::zeroed()
                 },
-            ));
-        }
-
-        let page = (paddr >> 12) as u32;
-        let idx_in_page = (paddr & 0xfff) as usize >> 3;
-        let off = (paddr & 0x7) as usize;
-        let htab = self.htab.upgradable_read();
-        if let Some(&b) = htab.get(&page) {
-            let bytes = &unsafe { b.as_ref() }[idx_in_page..];
-            let len = if in_bytes.len() & 0x7 != 0 {
-                in_bytes.len() >> 3 + 1
-            } else {
-                in_bytes.len() >> 3
-            };
-            if let Some(mut bytes) = bytes.get(..len) {
-                if in_bytes.len() < (8 - off) & 0x7 {
-                    let mut vbytes = bytes[0].load().to_le_bytes();
-                    vbytes[off..].copy_from_slice(in_bytes);
-                    bytes[0].store(u64::from_le_bytes(vbytes));
-                    in_bytes = &[];
-                    bytes = &bytes[1..];
-                } else if off != 0 {
-                    let mut vbytes = bytes[0].load().to_le_bytes();
-                    vbytes[off..].copy_from_slice(in_bytes);
-                    bytes[0].store(u64::from_le_bytes(vbytes));
-                    in_bytes = &in_bytes[(8 - off)..];
-                    bytes = &bytes[1..];
-                }
-                while in_bytes.len() != 0 {
-                    if in_bytes.len() < 8 {
-                        let mut vbytes = bytes[0].load().to_le_bytes();
-                        vbytes[..in_bytes.len()].copy_from_slice(in_bytes);
-                        bytes[0].store(u64::from_le_bytes(vbytes));
-                        in_bytes = &[];
-                        bytes = &bytes[1..];
+            ))
+        } else {
+            let addr = paddr as u32;
+            let mut npg = addr >> 12;
+            let mut off_in_pg = (addr & 0xfff) as usize;
+            while !out.is_empty() {
+                let guard = self.mem.upgradable_read();
+                if let Some(pg) = guard.get(&npg) {
+                    let bytes = &pg.0[off_in_pg..];
+                    if bytes.len() < out.len() {
+                        let (out1, out2) = out.split_at_mut(bytes.len());
+                        out1.copy_from_slice(bytes);
+                        out = out2;
+                        npg += 1;
+                        off_in_pg = 0;
                     } else {
-                        let vbytes = in_bytes[..8].try_into().unwrap();
-                        bytes[0].store(u64::from_le_bytes(vbytes));
-                        in_bytes = &in_bytes[8..];
-                        bytes = &bytes[1..];
+                        let len = out.len();
+                        out.copy_from_slice(&bytes[..len]);
+                        out = &mut out[len..];
+                    }
+                } else {
+                    let mut guard = RwLockUpgradableReadGuard::upgrade(guard);
+                    if !guard.contains_key(&npg) {
+                        Self::allocate(&mut guard, npg)?;
                     }
                 }
-            } else {
-                let len = bytes.len() << 3;
-                drop(bytes);
-                drop(htab);
-                self.write_bytes(paddr, &in_bytes[..len])?;
-                self.write_bytes((paddr & !0xfff) + 0x1000, &in_bytes[len..])?;
             }
-        } else {
-            let _ = unsafe { MemController::allocate(htab, page)? }; // Drop
-            self.write_bytes(paddr, in_bytes)?;
+            Ok(())
         }
+    }
 
-        Ok(())
+    pub fn write_bytes(&mut self, mut inbytes: &[u8], paddr: u64) -> CPUResult<()> {
+        if paddr > (u32::MAX as u64) {
+            Err(CPUException::PageFault(
+                paddr as i64,
+                FaultCharacteristics {
+                    pref: paddr as i64,
+                    flevel: 0,
+                    access_kind: AccessKind::Allocate,
+                    ..Zeroable::zeroed()
+                },
+            ))
+        } else {
+            let addr = paddr as u32;
+            let mut npg = addr >> 12;
+            let mut off_in_pg = (addr & 0xfff) as usize;
+            while !inbytes.is_empty() {
+                let guard = self.mem.get_mut();
+                if let Some(pg) = guard.get_mut(&npg) {
+                    let bytes = &mut pg.0[off_in_pg..];
+                    if bytes.len() < inbytes.len() {
+                        let (in1, in2) = inbytes.split_at(bytes.len());
+                        bytes.copy_from_slice(in1);
+                        inbytes = in2;
+                        npg += 1;
+                        off_in_pg = 0;
+                    } else {
+                        let len = inbytes.len();
+                        bytes[..len].copy_from_slice(inbytes);
+                        inbytes = &inbytes[len..];
+                    }
+                } else {
+                    if !guard.contains_key(&npg) {
+                        Self::allocate(guard, npg)?;
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 
     pub fn read<T: Pod>(&self, paddr: u64) -> CPUResult<T> {
-        let mut ret = T::zeroed();
+        let mut out = T::zeroed();
 
-        self.read_bytes(
-            paddr,
-            bytemuck::cast_slice_mut(core::slice::from_mut(&mut ret)),
-        )?;
+        self.read_bytes(bytemuck::bytes_of_mut(&mut out), paddr)?;
 
-        Ok(ret)
+        Ok(out)
     }
 
-    pub fn write<T: Pod>(&self, paddr: u64, val: T) -> CPUResult<()> {
-        self.write_bytes(paddr, bytemuck::cast_slice(core::slice::from_ref(&val)))
+    pub fn write<T: Pod>(&mut self, value: T, paddr: u64) -> CPUResult<()> {
+        self.write_bytes(bytemuck::bytes_of(&value), paddr)
     }
 }
 
-pub struct MemBus {
-    ctrl: RwLock<MemController>,
+pub struct MemoryBus {
+    mem: RwLock<MemoryController>,
 }
 
-impl MemBus {
-    pub fn new() -> MemBus {
-        MemBus {
-            ctrl: RwLock::new(MemController::new()),
+impl MemoryBus {
+    pub fn new() -> Self {
+        Self {
+            mem: RwLock::new(MemoryController::new()),
         }
     }
 
-    pub fn with_locked_bus<T, F: FnOnce(&MemController) -> CPUResult<T>>(
-        &self,
-        f: F,
-    ) -> CPUResult<T> {
-        f(&self.ctrl.write())
+    pub fn with_unlocked_bus<U, F: FnOnce(&MemoryController) -> U>(&self, f: F) -> U {
+        (f)(&self.mem.read())
     }
 
-    pub fn read_bytes(&self, paddr: u64, out: &mut [u8]) -> CPUResult<()> {
-        self.ctrl.read().read_bytes(paddr, out)
+    pub fn with_locked_bus<U, F: FnOnce(&mut MemoryController) -> U>(&self, f: F) -> U {
+        (f)(&mut self.mem.write())
     }
 
-    pub fn write_bytes(&self, paddr: u64, in_bytes: &[u8]) -> CPUResult<()> {
-        self.ctrl.read().write_bytes(paddr, in_bytes)
-    }
-
-    pub fn read<T: Pod>(&self, paddr: u64) -> CPUResult<T> {
-        let mut ret = T::zeroed();
-
-        self.read_bytes(
-            paddr,
-            bytemuck::cast_slice_mut(core::slice::from_mut(&mut ret)),
-        )?;
-
-        Ok(ret)
-    }
-
-    pub fn write<T: Pod>(&self, paddr: u64, val: T) -> CPUResult<()> {
-        self.write_bytes(paddr, bytemuck::cast_slice(core::slice::from_ref(&val)))
+    pub fn get_mut(&mut self) -> &mut MemoryController {
+        self.mem.get_mut()
     }
 }

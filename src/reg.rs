@@ -30,6 +30,9 @@ pub union RegsRaw {
     pub array: [u64; 64],
 }
 
+unsafe impl Zeroable for RegsRaw {}
+unsafe impl Pod for RegsRaw {}
+
 impl<I: SliceIndex<[u64]>> Index<I> for RegsRaw {
     type Output = <I as SliceIndex<[u64]>>::Output;
 

@@ -11,9 +11,9 @@ fp = []
 simd = [] # TODO, this is not defined by the ISA Spec
 
 [dependencies]
-bytemuck = {git="https://github.com/Lokathor/bytemuck",features=["derive","min_const_generics"]}
 parking_lot = "0.11.1"
+bytemuck = {git="https://github.com/Lokathor/bytemuck",features=["derive","min_const_generics"]}
+
 fake-enum = "0.1.2"
-tearor = "0.1.0"
-cached = "0.23.0"
+lru_time_cache = "0.11.11"
 bitflags = "1.2.1"
