@@ -1,11 +1,35 @@
 use std::{
+    fmt::{Debug, Formatter},
     ops::{Deref, DerefMut, Index, IndexMut},
     slice::SliceIndex,
 };
 
+use half::f16;
+
 use bytemuck::{Pod, Zeroable};
 
 use crate::error::{CPUException, CPUResult};
+
+#[repr(C, align(128))]
+#[derive(Copy, Clone)]
+pub union Vector128 {
+    pub i64v2: [u64; 2],
+    pub i32v4: [u32; 4],
+    pub i16v8: [u16; 8],
+    pub i8v16: [u8; 16],
+    pub f64v2: [f64; 2],
+    pub f32v4: [f32; 4],
+    pub f16v2: [f16; 8],
+}
+
+impl Debug for Vector128 {
+    fn fmt(&self, fmt: &mut Formatter) -> core::fmt::Result {
+        self.i64v2.fmt(fmt)
+    }
+}
+
+unsafe impl Zeroable for Vector128 {}
+unsafe impl Pod for Vector128 {}
 
 #[derive(Copy, Clone, Zeroable, Pod, Debug)]
 #[repr(C, align(512))]
@@ -21,13 +45,14 @@ pub struct RegsNamed {
     pub reserved1: [u64; 5],
     pub mscr: [u64; 6],
     pub undefined: u64,
+    pub vector: [Vector128; 32],
 }
 
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub union RegsRaw {
     pub named: RegsNamed,
-    pub array: [u64; 64],
+    pub array: [u64; 128],
 }
 
 unsafe impl Zeroable for RegsRaw {}
@@ -72,7 +97,7 @@ impl RegsRaw {
     }
 
     #[inline]
-    pub fn from_array(array: [u64; 64]) -> RegsRaw {
+    pub fn from_array(array: [u64; 128]) -> RegsRaw {
         RegsRaw { array }
     }
 

@@ -10,8 +10,9 @@ checksum = "cf1de2fe8c75bc145a2f577add951f8134889b4795d47466a54a5c846d691693"
 
 [[package]]
 name = "bytemuck"
-version = "1.5.2-alpha.0"
-source = "git+https://github.com/Lokathor/bytemuck#cd8dbd64e9e45c6562a9d5f78a7430509462977d"
+version = "1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9966d2ab714d0f785dbac0a0396251a35280aeb42413281617d0209ab4898435"
 dependencies = [
  "bytemuck_derive",
 ]
@@ -40,6 +41,7 @@ dependencies = [
  "bitflags",
  "bytemuck",
  "fake-enum",
+ "half",
  "lru_time_cache",
  "parking_lot",
 ]
@@ -49,6 +51,15 @@ name = "fake-enum"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f8ca6dbc3dc38491fc5f701c24aa20cae892afaaca9f725232dff22de7ce95"
+
+[[package]]
+name = "half"
+version = "1.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62aca2aba2d62b4a7f5b33f3712cb1b0692779a56fb510499d5c0aa594daeaf3"
+dependencies = [
+ "bytemuck",
+]
 
 [[package]]
 name = "instant"

@@ -30,6 +30,92 @@ fn ss_to_mask(ss: u16) -> u64 {
     (2u64.wrapping_shl(8u32.wrapping_shl(ss as u32) - 1)).wrapping_sub(1)
 }
 
+fn signex(val: u64, ss: u16) -> u64 {
+    let mut val = val as i64;
+    let shift = 64 - (8u32.wrapping_shl(ss as u32) - 1);
+    val <<= shift;
+    val >>= shift;
+    val as u64
+}
+
+fn flags_bits(x: u64) -> u64 {
+    let mut bits = 0;
+    if x == 0 {
+        bits |= 2
+    }
+    if x.count_ones() % 2 != 0 {
+        bits |= 0x10
+    }
+    if x & 0x8000000000000000 != 0 {
+        bits |= 8
+    }
+    bits
+}
+
+fn execute_binop(val1: u64, val2: u64, ss: u16, f: impl Fn(u64, u64) -> (u64, bool)) -> (u64, u64) {
+    let (result, v) = (f)(val1, val2);
+    let mut fbits = flag_bits(result);
+    fbits |= (v as u64)
+        | (result & (1u64.wrapping_shl(8 << (ss as u32)))).wrapping_shr(8 << (ss as u32));
+    fbits |= (!(((val1 ^ result) & (1u64.wrapping_shl(8 << (ss as u32) - 1)))
+        .wrapping_shr(8 << (ss as u32) - 1)
+        ^ (fbits & 1))
+        & 1)
+        << 2;
+    (result, fbits)
+}
+
+pub enum Operand {
+    Register {
+        r: u16,
+        ss: u16,
+    },
+    IndirectRegister {
+        r: u16,
+        ss: u16,
+        offset: u16,
+        scale: u16,
+    },
+    Immediate {
+        val: u64,
+        ss: u16,
+        pcrel: bool,
+        memory_ref: bool,
+    },
+}
+
+impl Operand {
+    pub const fn is_simple(&self) -> bool {
+        matches!(
+            self,
+            Operand::Register { .. }
+                | Operand::Immediate {
+                    memory_ref: false,
+                    ..
+                }
+        )
+    }
+    pub const fn is_writable(&self) -> bool {
+        matches!(
+            self,
+            Operand::Register { .. }
+                | Operand::IndirectRegister { .. }
+                | Operand::Immediate {
+                    memory_ref: true,
+                    ..
+                }
+        )
+    }
+
+    pub const fn size(&self) -> u16 {
+        match self {
+            Operand::Register { ss, .. } => *ss,
+            Operand::IndirectRegister { ss, .. } => *ss,
+            Operand::Immediate { ss, .. } => *ss,
+        }
+    }
+}
+
 impl<'a> CPU<'a> {
     pub fn new(bus: &'a MemoryBus) -> Self {
         CPU {
@@ -122,33 +208,250 @@ impl<'a> CPU<'a> {
         Ok(())
     }
 
+    pub fn fetch_operand(&mut self) -> CPUResult<(Operand, i64)> {
+        let val = self.read::<u16>(self.regs.ip, AccessKind::Execute)?;
+
+        match val >> 14 {
+            0b00 => {
+                if val & 0b001110011000000 != 0 {
+                    return Err(CPUException::Undefined);
+                }
+
+                let ss = (val >> 8) & 0b11;
+                Ok((
+                    Operand::Register {
+                        r: val & 0b111111,
+                        ss,
+                    },
+                    2,
+                ))
+            }
+            0b01 => {
+                let r = val & 0b1111;
+                let ss = (val & 0b110000) >> 4;
+                let k = val & 0b10000 != 0;
+                let offset = (val & 0b0011111110000000) >> (7 + 3 * (k as u32));
+                let scale = 1u16 << ((val & 0b1110000000 & (-(k as i16) as u16)) >> 7);
+                Ok((
+                    Operand::IndirectRegister {
+                        r,
+                        ss,
+                        offset,
+                        scale,
+                    },
+                    2,
+                ))
+            }
+            0b10 => {
+                if val & 0b0010000000000000 != 0 {
+                    return Err(CPUException::Undefined);
+                }
+
+                let pcrel = val & 0b0001000000000000 != 0;
+                let val = val & ((1 << 12) - 1);
+                Ok((
+                    Operand::Immediate {
+                        val: val as u64,
+                        pcrel,
+                        memory_ref: false,
+                        ss: 3,
+                    },
+                    2,
+                ))
+            }
+            0b11 => {
+                if val & 0b0001100011111111 != 0 {
+                    return Err(CPUException::Undefined);
+                }
+                let pcrel = val & 0b0000010000000000 != 0;
+                let memory_ref = val & 0b0010000000000000 != 0;
+                let ss = ((val & 0b0000001100000000) >> 8) + 1;
+                if ss == 4 {
+                    return Err(CPUException::Undefined);
+                }
+                let mut val = [0u8; 8];
+                self.read_bytes(&mut val[..(1 << ss)], self.regs.ip + 2, AccessKind::Execute)?;
+                Ok((
+                    Operand::Immediate {
+                        val: u64::from_le_bytes(val),
+                        ss,
+                        pcrel,
+                        memory_ref,
+                    },
+                    2 + 1 << (ss as u32),
+                ))
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn read_operand(&mut self, op: Operand) -> CPUResult<u64> {
+        Ok(match op {
+            Operand::Register { r, ss } => {
+                if self.regs.flags & 0x40000 && (32..63).contains(&r) {
+                    return Err(CPUException::SystemProtection(0));
+                }
+                *self.regs.get_if_valid(r)? & ss_to_mask(ss)
+            }
+            Operand::IndirectRegister {
+                r,
+                ss,
+                offset,
+                scale,
+            } => {
+                let addr = self.regs[r] as i64 + (offset * scale) as i64;
+                let mut buf = [0u8; 8];
+                self.read_bytes(&mut buf[..(1 << (ss as u32))], addr, AccessKind::Read)?;
+                u64::from_le_bytes(buf);
+            }
+            Operand::Immediate {
+                mut val,
+                ss,
+                pcrel,
+                memory_ref,
+            } => {
+                if pcrel {
+                    val = (self::signex(val, ss) + self.regs.ip) as u64;
+                }
+
+                if memory_ref {
+                    let mut buf = [0u8; 8];
+                    self.read_bytes(&mut buf[..(1 << (ss as u32))], val as i64, AccessKind::Read)?;
+                    u64::from_le_bytes(buf);
+                } else {
+                    val
+                }
+            }
+        })
+    }
+
+    pub fn write_operand(&mut self, val: u64, op: Operand) -> CPUResult<()> {
+        Ok(match op {
+            Operand::Register { r, ss } => {
+                if self.regs.flags & 0x40000 && (32..63).contains(&r) {
+                    return Err(CPUException::SystemProtection(0));
+                } else if let 16 | 17 = r {
+                    return Err(CPUException::Undefined);
+                }
+
+                *self.regs.get_mut_if_valid(r as usize)? = val & ss_to_mask(ss);
+            }
+            Operand::IndirectRegister {
+                r,
+                ss,
+                offset,
+                scale,
+            } => {
+                let buf = val.to_le_bytes();
+                let addr = self.regs[r] as i64 + (offset * scale) as i64;
+                self.write_bytes(&buf, addr, AccessKind::Write)?;
+            }
+            Operand::Immediate {
+                val: mut addr,
+                ss,
+                pcrel,
+                memory_ref,
+            } => {
+                if !memory_ref {
+                    return Err(CPUException::Undefined);
+                }
+
+                if pcrel {
+                    addr = signex(addr, ss) + (self.regs.ip as u64);
+                }
+
+                let buf = val.to_le_bytes();
+                self.write_bytes(&buf, addr as i64, AccessKind::Write)?;
+            }
+        })
+    }
+
+    pub fn get_operand_addr(&mut self, op: Operand) -> CPUResult<i64> {
+        match op {
+            Operand::IndirectRegister {
+                r,
+                ss: _,
+                scale,
+                offset,
+            } => {
+                let val = self.regs[r] as i64;
+                Ok(val + (offset as i64 * scale as i64))
+            }
+            Operand::Immediate {
+                val,
+                ss,
+                pcrel,
+                memory_ref: true,
+            } => {
+                if pcrel {
+                    Ok(self.regs.ip + signex(val, ss))
+                } else {
+                    Ok(val & ss_to_mask(ss) as i64)
+                }
+            }
+            _ => Err(CPUException::Undefined),
+        }
+    }
+
     pub fn read_bytes(
         &mut self,
         mut out: &mut [u8],
         mut vaddr: i64,
         acc: AccessKind,
     ) -> CPUResult<()> {
-        while !out.is_empty() {
-            let paddr = self.lookup_paddr(vaddr, acc)?;
-            let mlen = (0x1000 - paddr & 0xfff) as usize;
+        if self.regs.cr[0] & 1 == 0 {
+            self.bus
+                .with_unlocked_bus(|c| c.read_bytes(out, vaddr as u64))
+        } else {
+            while !out.is_empty() {
+                let paddr = self.lookup_paddr(vaddr, acc)?;
+                let mlen = (0x1000 - paddr & 0xfff) as usize;
 
-            if out.len() < mlen {
-                self.bus.with_unlocked_bus(|c| c.read_bytes(out, paddr))?;
-                out = &mut [];
-            } else {
-                let (out1, out2) = out.split_at_mut(mlen);
-                self.bus.with_unlocked_bus(|c| c.read_bytes(out1, paddr))?;
-                out = out2;
-                vaddr += mlen as i64;
+                if out.len() < mlen {
+                    self.bus.with_unlocked_bus(|c| c.read_bytes(out, paddr))?;
+                    out = &mut [];
+                } else {
+                    let (out1, out2) = out.split_at_mut(mlen);
+                    self.bus.with_unlocked_bus(|c| c.read_bytes(out1, paddr))?;
+                    out = out2;
+                    vaddr += mlen as i64;
+                }
             }
+            Ok(())
         }
-        Ok(())
     }
 
     pub fn read<T: Pod>(&mut self, vaddr: i64, acc: AccessKind) -> CPUResult<T> {
         let mut val = Zeroable::zeroed();
         self.read_bytes(bytemuck::bytes_of_mut(&mut val), vaddr, acc)?;
         Ok(val)
+    }
+
+    pub fn write_bytes(&mut self, mut buf: &[u8], vaddr: i64, acc: AccessKind) -> CPUResult<()> {
+        if self.regs.cr[0] & 1 == 0 {
+            self.bus
+                .with_unlocked_bus(|c| c.read_bytes(out, vaddr as u64))
+        } else {
+            while !buf.is_empty() {
+                let paddr = self.lookup_paddr(vaddr, acc)?;
+                let mlen = (0x1000 - paddr & 0xfff) as usize;
+
+                if buf.len() < mlen {
+                    self.bus.with_locked_bus(|c| c.write_bytes(buf, paddr))?;
+                    buf = &[];
+                } else {
+                    let (out1, out2) = buf.split_at(mlen);
+                    self.bus.with_locked_bus(|c| c.write_bytes(out1, paddr))?;
+                    buf = buf;
+                    vaddr += mlen as i64;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    pub fn write<T: Pod>(&mut self, value: T, vaddr: i64, acc: AccessKind) -> CPUException<()> {
+        self.write_bytes(bytemuck::as_bytes(&value), vaddr, acc)
     }
 
     pub fn tick(&mut self) -> CPUResult<()> {
@@ -159,7 +462,135 @@ impl<'a> CPU<'a> {
             let opcode = self.read::<u16>(self.regs.ip, AccessKind::Execute)?;
             let h = opcode & 0xf;
 
-            match opcode {
+            match opcode >> 4 {
+                0x001 => {
+                    let (op1, ip) = self.fetch_operand()?;
+                    self.regs.ip = ip;
+                    let (op2, ip) = self.fetch_operand()?;
+                    self.regs.ip = ip;
+                    if !op1.is_simple() && !op2.is_simple() {
+                        return Err(CPUException::Undefined);
+                    }
+                    let val1 = self.read_operand(op1)?;
+                    let val2 = self.read_operand(op2)?;
+                    if h & 0b1110 != 0 {
+                        return Err(CPUException::Undefined);
+                    }
+                    let (res, flags) = execute_binop(
+                        val1,
+                        val2,
+                        op1.size().max(op2.size()),
+                        <u64>::overflowing_add,
+                    );
+                    self.write_operand(op1, res)?;
+                    if h & 0b0001 != 0 {
+                        self.regs.flags = self.regs.flags & !0b11111 | flags;
+                    }
+                    Ok(())
+                }
+                0x002 => {
+                    let (op1, ip) = self.fetch_operand()?;
+                    self.regs.ip = ip;
+                    let (op2, ip) = self.fetch_operand()?;
+                    self.regs.ip = ip;
+                    if !op1.is_simple() && !op2.is_simple() {
+                        return Err(CPUException::Undefined);
+                    }
+                    let val1 = self.read_operand(op1)?;
+                    let val2 = self.read_operand(op2)?;
+                    if h & 0b1110 != 0 {
+                        return Err(CPUException::Undefined);
+                    }
+                    let (res, flags) = execute_binop(
+                        val1,
+                        val2,
+                        op1.size().max(op2.size()),
+                        <u64>::overflowing_sub,
+                    );
+                    self.write_operand(op1, res)?;
+                    if h & 0b0001 != 0 {
+                        self.regs.flags = self.regs.flags & !0b11111 | flags;
+                    }
+                    Ok(())
+                }
+                0x003 => {
+                    let (op1, ip) = self.fetch_operand()?;
+                    self.regs.ip = ip;
+                    let (op2, ip) = self.fetch_operand()?;
+                    self.regs.ip = ip;
+                    if !op1.is_simple() && !op2.is_simple() {
+                        return Err(CPUException::Undefined);
+                    }
+                    let val1 = self.read_operand(op1)?;
+                    let val2 = self.read_operand(op2)?;
+                    if h & 0b1110 != 0 {
+                        return Err(CPUException::Undefined);
+                    }
+                    let res = val1 & val2;
+                    let flags = flags_bits(res);
+                    self.write_operand(op1, res)?;
+                    if h & 0b0001 != 0 {
+                        self.regs.flags = self.regs.flags & !0b11111 | flags;
+                    }
+                    Ok(())
+                }
+                0x004 => {
+                    let (op1, ip) = self.fetch_operand()?;
+                    self.regs.ip = ip;
+                    let (op2, ip) = self.fetch_operand()?;
+                    self.regs.ip = ip;
+                    if !op1.is_simple() && !op2.is_simple() {
+                        return Err(CPUException::Undefined);
+                    }
+                    let val1 = self.read_operand(op1)?;
+                    let val2 = self.read_operand(op2)?;
+                    if h & 0b1110 != 0 {
+                        return Err(CPUException::Undefined);
+                    }
+                    let res = val1 | val2;
+                    let flags = flags_bits(res);
+                    self.write_operand(op1, res)?;
+                    if h & 0b0001 != 0 {
+                        self.regs.flags = self.regs.flags & !0b11111 | flags;
+                    }
+                    Ok(())
+                }
+                0x005 => {
+                    let (op1, ip) = self.fetch_operand()?;
+                    self.regs.ip = ip;
+                    let (op2, ip) = self.fetch_operand()?;
+                    self.regs.ip = ip;
+                    if !op1.is_simple() && !op2.is_simple() {
+                        return Err(CPUException::Undefined);
+                    }
+                    let val1 = self.read_operand(op1)?;
+                    let val2 = self.read_operand(op2)?;
+                    if h & 0b1110 != 0 {
+                        return Err(CPUException::Undefined);
+                    }
+                    let res = val1 ^ val2;
+                    let flags = flags_bits(res);
+                    self.write_operand(op1, res)?;
+                    if h & 0b0001 == 0 {
+                        self.regs.flags = self.regs.flags & !0b11111 | flags;
+                    }
+                    Ok(())
+                }
+                0x006 => {
+                    if h & 0b0010 != 0 {
+                        return Err(CPUException::Undefined);
+                    }
+                    let val1 = self.regs[0] as u128;
+                    let val2 = self.regs[3] as u128;
+                    let ss = h >> 2;
+                    let res = val1 * val2;
+                    self.regs[0] = (res as u64) & ss_to_mask(ss);
+                    self.regs[1] = (res >> (1 << (8 << (ss as u32)))) & ss_to_mask(ss);
+                    if h & 0b0001 == 0 {
+                        let p = (res.count_ones() % 2 as u64) << 5;
+                        let c = (res & (ss_to_mask(ss) as u128) != res) as u64;
+                    }
+                }
                 _ => Err(CPUException::Undefined),
             }
         }
