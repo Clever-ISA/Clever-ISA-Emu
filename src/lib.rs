@@ -1,3 +1,6 @@
+#[cfg(not(target_endian = "little"))]
+compile_error!("Clever-ISA EMU only functions on little-endian processors");
+
 pub mod reg;
 
 pub mod error;

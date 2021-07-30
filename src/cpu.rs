@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, convert::TryInto};
 
 use lru_time_cache::LruCache;
 
@@ -54,7 +54,7 @@ fn flags_bits(x: u64) -> u64 {
 
 fn execute_binop(val1: u64, val2: u64, ss: u16, f: impl Fn(u64, u64) -> (u64, bool)) -> (u64, u64) {
     let (result, v) = (f)(val1, val2);
-    let mut fbits = flag_bits(result);
+    let mut fbits = flags_bits(result);
     fbits |= (v as u64)
         | (result & (1u64.wrapping_shl(8 << (ss as u32)))).wrapping_shr(8 << (ss as u32));
     fbits |= (!(((val1 ^ result) & (1u64.wrapping_shl(8 << (ss as u32) - 1)))
@@ -65,6 +65,7 @@ fn execute_binop(val1: u64, val2: u64, ss: u16, f: impl Fn(u64, u64) -> (u64, bo
     (result, fbits)
 }
 
+#[derive(Copy, Clone, Debug)]
 pub enum Operand {
     Register {
         r: u16,
@@ -208,10 +209,10 @@ impl<'a> CPU<'a> {
         Ok(())
     }
 
-    pub fn fetch_operand(&mut self) -> CPUResult<(Operand, i64)> {
+    pub fn fetch_operand(&mut self) -> CPUResult<Operand> {
         let val = self.read::<u16>(self.regs.ip, AccessKind::Execute)?;
 
-        match val >> 14 {
+        let (ret, ip) = match val >> 14 {
             0b00 => {
                 if val & 0b001110011000000 != 0 {
                     return Err(CPUException::Undefined);
@@ -282,13 +283,15 @@ impl<'a> CPU<'a> {
                 ))
             }
             _ => unreachable!(),
-        }
+        }?;
+        self.regs.ip = ip;
+        Ok(ret)
     }
 
     pub fn read_operand(&mut self, op: Operand) -> CPUResult<u64> {
         Ok(match op {
             Operand::Register { r, ss } => {
-                if self.regs.flags & 0x40000 && (32..63).contains(&r) {
+                if (self.regs.flags & 0x40000) != 0 && (32..63).contains(&r) {
                     return Err(CPUException::SystemProtection(0));
                 }
                 *self.regs.get_if_valid(r)? & ss_to_mask(ss)
@@ -301,8 +304,8 @@ impl<'a> CPU<'a> {
             } => {
                 let addr = self.regs[r] as i64 + (offset * scale) as i64;
                 let mut buf = [0u8; 8];
-                self.read_bytes(&mut buf[..(1 << (ss as u32))], addr, AccessKind::Read)?;
-                u64::from_le_bytes(buf);
+                self.read_bytes(&mut buf[..(1 << (ss as u32))], addr, AccessKind::Access)?;
+                u64::from_le_bytes(buf)
             }
             Operand::Immediate {
                 mut val,
@@ -311,13 +314,17 @@ impl<'a> CPU<'a> {
                 memory_ref,
             } => {
                 if pcrel {
-                    val = (self::signex(val, ss) + self.regs.ip) as u64;
+                    val = (self::signex(val, ss) as i64 + self.regs.ip) as u64;
                 }
 
                 if memory_ref {
                     let mut buf = [0u8; 8];
-                    self.read_bytes(&mut buf[..(1 << (ss as u32))], val as i64, AccessKind::Read)?;
-                    u64::from_le_bytes(buf);
+                    self.read_bytes(
+                        &mut buf[..(1 << (ss as u32))],
+                        val as i64,
+                        AccessKind::Access,
+                    )?;
+                    u64::from_le_bytes(buf)
                 } else {
                     val
                 }
@@ -328,17 +335,17 @@ impl<'a> CPU<'a> {
     pub fn write_operand(&mut self, val: u64, op: Operand) -> CPUResult<()> {
         Ok(match op {
             Operand::Register { r, ss } => {
-                if self.regs.flags & 0x40000 && (32..63).contains(&r) {
+                if (self.regs.flags & 0x40000) != 0 && (32..63).contains(&r) {
                     return Err(CPUException::SystemProtection(0));
                 } else if let 16 | 17 = r {
                     return Err(CPUException::Undefined);
                 }
 
-                *self.regs.get_mut_if_valid(r as usize)? = val & ss_to_mask(ss);
+                *self.regs.get_mut_if_valid(r)? = val & ss_to_mask(ss);
             }
             Operand::IndirectRegister {
                 r,
-                ss,
+                ss: _ss,
                 offset,
                 scale,
             } => {
@@ -384,9 +391,9 @@ impl<'a> CPU<'a> {
                 memory_ref: true,
             } => {
                 if pcrel {
-                    Ok(self.regs.ip + signex(val, ss))
+                    Ok(self.regs.ip + (signex(val, ss) as i64))
                 } else {
-                    Ok(val & ss_to_mask(ss) as i64)
+                    Ok((val & ss_to_mask(ss)) as i64)
                 }
             }
             _ => Err(CPUException::Undefined),
@@ -427,10 +434,15 @@ impl<'a> CPU<'a> {
         Ok(val)
     }
 
-    pub fn write_bytes(&mut self, mut buf: &[u8], vaddr: i64, acc: AccessKind) -> CPUResult<()> {
+    pub fn write_bytes(
+        &mut self,
+        mut buf: &[u8],
+        mut vaddr: i64,
+        acc: AccessKind,
+    ) -> CPUResult<()> {
         if self.regs.cr[0] & 1 == 0 {
             self.bus
-                .with_unlocked_bus(|c| c.read_bytes(out, vaddr as u64))
+                .with_locked_bus(|c| c.write_bytes(buf, vaddr as u64))
         } else {
             while !buf.is_empty() {
                 let paddr = self.lookup_paddr(vaddr, acc)?;
@@ -442,7 +454,7 @@ impl<'a> CPU<'a> {
                 } else {
                     let (out1, out2) = buf.split_at(mlen);
                     self.bus.with_locked_bus(|c| c.write_bytes(out1, paddr))?;
-                    buf = buf;
+                    buf = out2;
                     vaddr += mlen as i64;
                 }
             }
@@ -450,8 +462,8 @@ impl<'a> CPU<'a> {
         }
     }
 
-    pub fn write<T: Pod>(&mut self, value: T, vaddr: i64, acc: AccessKind) -> CPUException<()> {
-        self.write_bytes(bytemuck::as_bytes(&value), vaddr, acc)
+    pub fn write<T: Pod>(&mut self, value: T, vaddr: i64, acc: AccessKind) -> CPUResult<()> {
+        self.write_bytes(bytemuck::bytes_of(&value), vaddr, acc)
     }
 
     pub fn tick(&mut self) -> CPUResult<()> {
@@ -464,10 +476,8 @@ impl<'a> CPU<'a> {
 
             match opcode >> 4 {
                 0x001 => {
-                    let (op1, ip) = self.fetch_operand()?;
-                    self.regs.ip = ip;
-                    let (op2, ip) = self.fetch_operand()?;
-                    self.regs.ip = ip;
+                    let op1 = self.fetch_operand()?;
+                    let op2 = self.fetch_operand()?;
                     if !op1.is_simple() && !op2.is_simple() {
                         return Err(CPUException::Undefined);
                     }
@@ -482,17 +492,15 @@ impl<'a> CPU<'a> {
                         op1.size().max(op2.size()),
                         <u64>::overflowing_add,
                     );
-                    self.write_operand(op1, res)?;
+                    self.write_operand(res, op1)?;
                     if h & 0b0001 != 0 {
                         self.regs.flags = self.regs.flags & !0b11111 | flags;
                     }
                     Ok(())
                 }
                 0x002 => {
-                    let (op1, ip) = self.fetch_operand()?;
-                    self.regs.ip = ip;
-                    let (op2, ip) = self.fetch_operand()?;
-                    self.regs.ip = ip;
+                    let op1 = self.fetch_operand()?;
+                    let op2 = self.fetch_operand()?;
                     if !op1.is_simple() && !op2.is_simple() {
                         return Err(CPUException::Undefined);
                     }
@@ -507,17 +515,15 @@ impl<'a> CPU<'a> {
                         op1.size().max(op2.size()),
                         <u64>::overflowing_sub,
                     );
-                    self.write_operand(op1, res)?;
+                    self.write_operand(res, op1)?;
                     if h & 0b0001 != 0 {
                         self.regs.flags = self.regs.flags & !0b11111 | flags;
                     }
                     Ok(())
                 }
                 0x003 => {
-                    let (op1, ip) = self.fetch_operand()?;
-                    self.regs.ip = ip;
-                    let (op2, ip) = self.fetch_operand()?;
-                    self.regs.ip = ip;
+                    let op1 = self.fetch_operand()?;
+                    let op2 = self.fetch_operand()?;
                     if !op1.is_simple() && !op2.is_simple() {
                         return Err(CPUException::Undefined);
                     }
@@ -528,17 +534,15 @@ impl<'a> CPU<'a> {
                     }
                     let res = val1 & val2;
                     let flags = flags_bits(res);
-                    self.write_operand(op1, res)?;
+                    self.write_operand(res, op1)?;
                     if h & 0b0001 != 0 {
-                        self.regs.flags = self.regs.flags & !0b11111 | flags;
+                        self.regs.flags = self.regs.flags & !0b11010 | flags;
                     }
                     Ok(())
                 }
                 0x004 => {
-                    let (op1, ip) = self.fetch_operand()?;
-                    self.regs.ip = ip;
-                    let (op2, ip) = self.fetch_operand()?;
-                    self.regs.ip = ip;
+                    let op1 = self.fetch_operand()?;
+                    let op2 = self.fetch_operand()?;
                     if !op1.is_simple() && !op2.is_simple() {
                         return Err(CPUException::Undefined);
                     }
@@ -549,17 +553,15 @@ impl<'a> CPU<'a> {
                     }
                     let res = val1 | val2;
                     let flags = flags_bits(res);
-                    self.write_operand(op1, res)?;
+                    self.write_operand(res, op1)?;
                     if h & 0b0001 != 0 {
-                        self.regs.flags = self.regs.flags & !0b11111 | flags;
+                        self.regs.flags = self.regs.flags & !0b11010 | flags;
                     }
                     Ok(())
                 }
                 0x005 => {
-                    let (op1, ip) = self.fetch_operand()?;
-                    self.regs.ip = ip;
-                    let (op2, ip) = self.fetch_operand()?;
-                    self.regs.ip = ip;
+                    let op1 = self.fetch_operand()?;
+                    let op2 = self.fetch_operand()?;
                     if !op1.is_simple() && !op2.is_simple() {
                         return Err(CPUException::Undefined);
                     }
@@ -570,26 +572,151 @@ impl<'a> CPU<'a> {
                     }
                     let res = val1 ^ val2;
                     let flags = flags_bits(res);
-                    self.write_operand(op1, res)?;
+                    self.write_operand(res, op1)?;
                     if h & 0b0001 == 0 {
-                        self.regs.flags = self.regs.flags & !0b11111 | flags;
+                        self.regs.flags = self.regs.flags & !0b11010 | flags;
                     }
                     Ok(())
                 }
-                0x006 => {
-                    if h & 0b0010 != 0 {
+                // 0x006 => {
+                //     if h & 0b0010 != 0 {
+                //         return Err(CPUException::Undefined);
+                //     }
+                //     let val1 = self.regs[0] as u128;
+                //     let val2 = self.regs[3] as u128;
+                //     let ss = h >> 2;
+                //     let res = val1 * val2;
+                //     self.regs[0] = (res as u64) & ss_to_mask(ss);
+                //     self.regs[1] = (res >> (1 << (8 << (ss as u32)))) & ss_to_mask(ss);
+                //     if h & 0b0001 == 0 {
+                //         let p = (res.count_ones() % 2 as u64) << 5;
+                //         let c = (res & (ss_to_mask(ss) as u128) != res) as u64;
+                //     }
+                // }
+                0x008 => {
+                    if h != 0 {
                         return Err(CPUException::Undefined);
                     }
-                    let val1 = self.regs[0] as u128;
-                    let val2 = self.regs[3] as u128;
-                    let ss = h >> 2;
-                    let res = val1 * val2;
-                    self.regs[0] = (res as u64) & ss_to_mask(ss);
-                    self.regs[1] = (res >> (1 << (8 << (ss as u32)))) & ss_to_mask(ss);
-                    if h & 0b0001 == 0 {
-                        let p = (res.count_ones() % 2 as u64) << 5;
-                        let c = (res & (ss_to_mask(ss) as u128) != res) as u64;
+                    let dst = self.fetch_operand()?;
+                    let src = self.fetch_operand()?;
+                    if !matches!(dst, Operand::Register { .. })
+                        && !matches!(src, Operand::Register { .. })
+                    {
+                        return Err(CPUException::Undefined);
                     }
+                    if !dst.is_writable() {
+                        return Err(CPUException::Undefined);
+                    }
+
+                    let val = self.read_operand(src)?;
+                    self.regs.flags = self.regs.flags & !0b11010 | flags_bits(val);
+                    self.write_operand(val, dst)
+                }
+                0x009 => {
+                    if h != 0 {
+                        return Err(CPUException::Undefined);
+                    }
+                    let dst = self.fetch_operand()?;
+                    let src = self.fetch_operand()?;
+                    if !dst.is_writable() || !matches!(dst, Operand::Register { .. }) {
+                        return Err(CPUException::Undefined);
+                    }
+
+                    let val = self.get_operand_addr(src)?;
+                    self.write_operand(val as u64, dst)
+                }
+                0x00a => {
+                    let r = h;
+                    let src = self.fetch_operand()?;
+                    let val = self.get_operand_addr(src)? as u64;
+                    self.regs.flags = self.regs.flags & !0b11010 | flags_bits(val);
+                    self.regs[r] = val;
+                    Ok(())
+                }
+                0x00b => {
+                    let r = h;
+                    let dst = self.fetch_operand()?;
+                    if !dst.is_writable() {
+                        return Err(CPUException::Undefined);
+                    }
+                    let val = self.regs[r];
+                    self.regs.flags = self.regs.flags & !0b11010 | flags_bits(val);
+                    self.write_operand(val, dst)
+                }
+                0x014 => {
+                    if h != 0 {
+                        return Err(CPUException::Undefined);
+                    }
+                    let src = self.fetch_operand()?;
+                    let val = self.read_operand(src)?;
+                    let stack = self.regs.gprs[7] - 8;
+                    self.regs.gprs[7] -= 8;
+                    self.write(val, stack as i64, AccessKind::Write)
+                }
+                0x015 => {
+                    if h != 0 {
+                        return Err(CPUException::Undefined);
+                    }
+                    let dst = self.fetch_operand()?;
+                    if !dst.is_writable() || dst.size() != 8 {
+                        return Err(CPUException::Undefined);
+                    }
+
+                    let stack = self.regs.gprs[7];
+                    self.regs.gprs[7] += 8;
+                    let val = self.read::<u64>(stack as i64, AccessKind::Access)?;
+                    self.write_operand(val, dst)
+                }
+                0x0016 => {
+                    let r = h;
+                    let stack = self.regs.gprs[7] - 8;
+                    self.regs.gprs[7] -= 8;
+                    self.write(self.regs[r], stack as i64, AccessKind::Write)
+                }
+                0x017 => {
+                    let r = h;
+                    let stack = self.regs.gprs[7];
+                    self.regs.gprs[7] += 8;
+                    self.regs[r] = self.read::<u64>(stack as i64, AccessKind::Access)?;
+                    Ok(())
+                }
+                0x018 => {
+                    let dst = self.fetch_operand()?;
+                    let addr = self.get_operand_addr(dst)?;
+                    let gprs = self.regs.gprs;
+                    self.write(gprs, addr, AccessKind::Write)
+                }
+                0x019 => {
+                    let src = self.fetch_operand()?;
+                    let addr = self.get_operand_addr(src)?;
+                    let gprs = self.read(addr, AccessKind::Access)?;
+                    self.regs.gprs = gprs;
+                    Ok(())
+                }
+                0x01a => {
+                    let dst = self.fetch_operand()?;
+                    let addr = self.get_operand_addr(dst)?;
+                    let regs: [u64; 32] = self.regs.slice(..32).try_into().unwrap();
+                    self.write(regs, addr, AccessKind::Write)
+                }
+                0x01b => {
+                    let src = self.fetch_operand()?;
+                    let addr = self.get_operand_addr(src)?;
+                    let mut regs = self.read::<[u64; 32]>(addr, AccessKind::Access)?;
+                    if regs[18..24].ends_with(&[0; 6]) {
+                        return Err(CPUException::SystemProtection(0));
+                    }
+
+                    #[cfg(not(feature = "fp"))]
+                    {
+                        if regs[24..].ends_with(&[0; 6]) {
+                            return Err(CPUException::SystemProtection(0));
+                        }
+                    }
+
+                    regs[16] = self.regs[16];
+                    self.regs.slice_mut(..32).copy_from_slice(&regs);
+                    Ok(())
                 }
                 _ => Err(CPUException::Undefined),
             }

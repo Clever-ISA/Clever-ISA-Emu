@@ -24,7 +24,7 @@ pub union Vector128 {
 
 impl Debug for Vector128 {
     fn fmt(&self, fmt: &mut Formatter) -> core::fmt::Result {
-        self.i64v2.fmt(fmt)
+        unsafe { self.i64v2 }.fmt(fmt)
     }
 }
 
@@ -58,19 +58,19 @@ pub union RegsRaw {
 unsafe impl Zeroable for RegsRaw {}
 unsafe impl Pod for RegsRaw {}
 
-impl<I: SliceIndex<[u64]>> Index<I> for RegsRaw {
-    type Output = <I as SliceIndex<[u64]>>::Output;
+impl Index<u16> for RegsRaw {
+    type Output = u64;
 
     #[inline]
-    fn index(&self, idx: I) -> &Self::Output {
-        unsafe { &self.array[idx] }
+    fn index(&self, idx: u16) -> &Self::Output {
+        unsafe { &self.array[idx as usize] }
     }
 }
 
-impl<I: SliceIndex<[u64]>> IndexMut<I> for RegsRaw {
+impl IndexMut<u16> for RegsRaw {
     #[inline]
-    fn index_mut(&mut self, idx: I) -> &mut Self::Output {
-        unsafe { &mut self.array[idx] }
+    fn index_mut(&mut self, idx: u16) -> &mut Self::Output {
+        unsafe { &mut self.array[idx as usize] }
     }
 }
 
@@ -101,7 +101,7 @@ impl RegsRaw {
         RegsRaw { array }
     }
 
-    pub fn get_if_valid(&self, idx: usize) -> CPUResult<&u64> {
+    pub fn get_if_valid(&self, idx: u16) -> CPUResult<&u64> {
         match idx {
             18..=23 | 52..=55 => Err(CPUException::Undefined),
             #[cfg(not(feature = "fp"))]
@@ -111,7 +111,7 @@ impl RegsRaw {
         }
     }
 
-    pub fn get_mut_if_valid(&mut self, idx: usize) -> CPUResult<&mut u64> {
+    pub fn get_mut_if_valid(&mut self, idx: u16) -> CPUResult<&mut u64> {
         match idx {
             18..=23 | 52..=55 => Err(CPUException::Undefined),
             #[cfg(not(feature = "fp"))]
@@ -119,5 +119,12 @@ impl RegsRaw {
             idx @ 0..=62 => Ok(&mut self[idx]),
             _ => Err(CPUException::Undefined),
         }
+    }
+
+    pub fn slice<I: SliceIndex<[u64]>>(&self, idx: I) -> &I::Output {
+        unsafe { &self.array[idx] }
+    }
+    pub fn slice_mut<I: SliceIndex<[u64]>>(&mut self, idx: I) -> &mut I::Output {
+        unsafe { &mut self.array[idx] }
     }
 }
