@@ -10,3 +10,6 @@ pub mod mem;
 pub mod cpu;
 
 pub mod page;
+
+#[cfg(feature = "fp")]
+pub mod float;

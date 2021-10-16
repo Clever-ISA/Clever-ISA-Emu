@@ -7,6 +7,7 @@ use std::{
 use half::f16;
 
 use bytemuck::{Pod, Zeroable};
+use num_traits::{float::FloatCore, Float};
 
 use crate::error::{CPUException, CPUResult};
 
@@ -32,17 +33,20 @@ unsafe impl Zeroable for Vector128 {}
 unsafe impl Pod for Vector128 {}
 
 #[derive(Copy, Clone, Zeroable, Pod, Debug)]
+#[non_exhaustive]
 #[repr(C, align(512))]
 pub struct RegsNamed {
     pub gprs: [u64; 16],
     pub ip: i64,
     pub flags: u64,
-    pub reserved0: [u64; 6],
+    reserved18: u64,
+    pub fpcw: u64,
+    reserved20_23: [u64; 6],
     pub fp: [u64; 8],
     pub cr: [u64; 8],
     pub cpuinfo: [u64; 8],
     pub crx: [u64; 4],
-    pub reserved1: [u64; 5],
+    reserved1: [u64; 5],
     pub mscr: [u64; 6],
     pub undefined: u64,
     pub vector: [Vector128; 32],
@@ -52,7 +56,13 @@ pub struct RegsNamed {
 #[repr(C)]
 pub union RegsRaw {
     pub named: RegsNamed,
-    pub array: [u64; 128],
+    array: [u64; 128],
+}
+
+impl RegsRaw {
+    pub const fn new() {
+        Self { array: [0; 128] }
+    }
 }
 
 unsafe impl Zeroable for RegsRaw {}
