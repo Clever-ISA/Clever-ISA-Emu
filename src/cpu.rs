@@ -28,10 +28,9 @@ pub struct CPU {
     status: Status,
 }
 
-pub struct CPUMemoryController{
+pub struct CPUMemoryController {
     bus: Arc<MemoryBus>,
     regs: RegsRaw,
-    
 }
 
 pub struct Processor {
@@ -40,7 +39,28 @@ pub struct Processor {
 }
 
 mod cpuinfo {
+    pub const CPUID0: u64 = 0;
+    pub const CPUID1: u64 = 0;
 
+    const CPUEX2V: u64 = 0x0000000000000001;
+    const CPUEX2VAS: u64 = 0x0000000000000010;
+    const CPUEX2PAS: u64 = 0x0000000000000000;
+    #[cfg(feature = "float")]
+    const CPUEX2FP: u64 = 0x000000000000000200;
+    #[cfg(not(feature = "float"))]
+    const CPUEX2FP: u64 = 0x000000000000000000;
+
+    #[cfg(feature = "vector")]
+    const CPUEX2VEC: u64 = 0x000000000000001000;
+
+    #[cfg(not(feature = "vector"))]
+    const CPUEX2VEC: u64 = 0x000000000000000000;
+
+    pub const CPUEX2: u64 = CPUEX2V | CPUEX2PAS | CPUEX2VAS | CPUEX2FP | CPUEXEC2VEC;
+
+    pub const MSCPUEX: u64 = 0;
+
+    pub const CPUINFO: [u64; 8] = [CPUID0, CPUID1, CPUEX2, 0, 0, 0, 0, MSCPUEX];
 }
 
 impl Processor {
@@ -53,7 +73,6 @@ impl Processor {
         cpu.get_regs_mut().ip = 0xff00;
         cpu.get_regs_mut().flags = 0;
         cpu.get_regs_mut().cr[0] = 0;
-
-        Processor { mem, cpu }
+        cpu.get_regs_mut().cpuinfo = cpuinfo::CPUINFO
     }
 }

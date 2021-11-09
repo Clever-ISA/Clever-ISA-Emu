@@ -11,5 +11,5 @@ pub mod cpu;
 
 pub mod page;
 
-#[cfg(feature = "fp")]
+#[cfg(feature = "float")]
 pub mod float;
