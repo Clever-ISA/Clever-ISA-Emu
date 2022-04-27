@@ -1,7 +1,5 @@
 use std::num::FpCategory;
 
-use rug::{Assign, Float};
-
 use half::f16;
 
 #[derive(Clone, Debug, Copy)]
@@ -53,20 +51,21 @@ impl CleverFloat {
         )
     }
 
-    pub const POSITIVE_INFINITY: Self = positive_infinity(3);
-    pub const NEGATIVE_INFINITY: Self = negative_infinity(3);
-    pub const NAN: Self = nan(3);
+    pub const POSITIVE_INFINITY: Self = Self::positive_infinity(3);
+    pub const NEGATIVE_INFINITY: Self = Self::negative_infinity(3);
+    pub const NAN: Self = Self::nan(3);
 
     pub const fn positive_infinity(ss: u16) -> Self {
         [(); 1][(ss == 0) as usize];
 
-        Self(FORMATS[ss].3 << FORMATS[ss].0, ss)
+        Self(FORMATS[ss as usize].3 << FORMATS[ss as usize].0, ss)
     }
 
     pub const fn negative_infinity(ss: u16) -> Self {
         [(); 1][(ss == 0) as usize];
         Self(
-            (FORMATS[ss].3 << FORMATS[ss].0) | 1u64 << (FORMATS[ss].0 + FORMATS[ss].1),
+            (FORMATS[ss as usize].3 << FORMATS[ss as usize].0)
+                | 1u64 << (FORMATS[ss as usize].0 + FORMATS[ss as usize].1),
             ss,
         )
     }
@@ -75,30 +74,33 @@ impl CleverFloat {
         [(); 1][(ss == 0) as usize];
 
         Self(
-            (1u64 << (FORMATS[self.1].0 - 1)) | (FORMATS[ss].3 << FORMATS[ss].0),
+            (1u64 << (FORMATS[ss as usize].0 - 1))
+                | (FORMATS[ss as usize].3 << FORMATS[ss as usize].0),
             ss,
         )
     }
 
     pub const fn negative(self) -> bool {
-        self.0 & (1u64.wrapping_shl(8u32.wrapping_shl(ss as u32) - 1)) != 0
+        self.0 & (1u64.wrapping_shl(8u32.wrapping_shl(self.1 as u32) - 1)) != 0
     }
 
     pub const fn exponent(self) -> i64 {
-        (self.0 >> (FORMATS[self.1].0))
-            & ((1u64 << FORMATS[self.1].1) - 1) as i64 - FORMATS[Self.1].2
+        ((self.0 >> (FORMATS[self.1 as usize].0)) & ((1u64 << FORMATS[self.1 as usize].1) - 1))
+            as i64
+            - FORMATS[self.1 as usize].2
     }
 
     pub const fn classify(self) -> FpCategory {
-        let exp = (self.0 >> (FORMATS[self.1].0)) & ((1u64 << FORMATS[self.1].1) - 1);
-        let sig = (self.0) & (1u64 << (FORMATS[self.1].0));
+        let exp =
+            (self.0 >> (FORMATS[self.1 as usize].0)) & ((1u64 << FORMATS[self.1 as usize].1) - 1);
+        let sig = (self.0) & (1u64 << (FORMATS[self.1 as usize].0));
         if exp == 0 && sig != 0 {
             return FpCategory::Subnormal;
         } else if exp == 0 {
             return FpCategory::Zero;
-        } else if exp == FORMATS[self.1].3 && sig != 0 {
+        } else if exp == FORMATS[self.1 as usize].3 && sig != 0 {
             return FpCategory::Nan;
-        } else if exp == FORMATS[self.1].3 {
+        } else if exp == FORMATS[self.1 as usize].3 {
             return FpCategory::Infinite;
         } else {
             return FpCategory::Normal;
@@ -109,17 +111,17 @@ impl CleverFloat {
         [(); 1][(ss == 0) as usize]; // more const_panic hacks
                                      // Will t-compiler/const-eval finish bikeshedding soon enough to save panic errors?
                                      // Well...
-        let sig = self.0 & (1u64 << FORMATS[self.1].0).wrapping_sub(1);
+        let sig = self.0 & (1u64 << FORMATS[self.1 as usize].0).wrapping_sub(1);
         Ok(match self.classify() {
             FpCategory::Nan => Self(
                 ((self.negative() as u64) << (1u64.wrapping_shl(8u32.wrapping_shl(ss as u32) - 1)))
-                    | (1u64 << (FORMATS[self.1].0 - 1))
-                    | (FORMATS[ss].3 << FORMATS[ss].0),
+                    | (1u64 << (FORMATS[self.1 as usize].0 - 1))
+                    | (FORMATS[ss as usize].3 << FORMATS[ss as usize].0),
                 ss,
             ),
             FpCategory::Infinite => Self(
                 ((self.negative() as u64) << (1u64.wrapping_shl(8u32.wrapping_shl(ss as u32) - 1)))
-                    | (FORMATS[ss].3 << FORMATS[ss].0),
+                    | (FORMATS[ss as usize].3 << FORMATS[ss as usize].0),
                 ss,
             ),
             FpCategory::Zero => Self(
@@ -127,7 +129,7 @@ impl CleverFloat {
                 ss,
             ),
             FpCategory::Subnormal => {
-                let diffsig = (FORMATS[ss].0 as i32) - (FORMATS[self.1].0 as i32);
+                let diffsig = (FORMATS[ss as usize].0 as i32) - (FORMATS[self.1 as usize].0 as i32);
                 let sig = sig;
                 let rsig = if diffsig < 0 {
                     sig >> (-diffsig)
@@ -144,27 +146,27 @@ impl CleverFloat {
                 CleverFloat(val, ss)
             }
             FpCategory::Normal => {
-                let diffsig = (FORMATS[ss].0 as i32) - (FORMATS[self.1].0 as i32);
+                let diffsig = (FORMATS[ss as usize].0 as i32) - (FORMATS[self.1 as usize].0 as i32);
                 let rsig = if diffsig < 0 {
                     sig >> (-diffsig)
                 } else {
                     sig << diffsig
                 };
                 let exp = self.exponent();
-                if exp > FORMATS[ss].2 {
+                if exp > FORMATS[ss as usize].2 {
                     return Err((
                         FpException::OVERFLOW,
                         Self(
-                            (FORMATS[ss].3 << FORMATS[ss].0)
+                            (FORMATS[ss as usize].3 << FORMATS[ss as usize].0)
                                 | ((self.negative() as u64)
                                     << (1u64.wrapping_shl(8u32.wrapping_shl(ss as u32) - 1))),
                             ss,
                         ),
                     ));
-                } else if exp < -FORMATS[ss].2 {
-                    return Err((FpException::UNDERFLOW, Self())); // TODO, we can underflow to DENORMALs as well
+                } else if exp < -FORMATS[ss as usize].2 {
+                    return Err((FpException::UNDERFLOW, Self(0, ss))); // TODO, we can underflow to DENORMALs as well
                 } else {
-                    let raw_exp = ((exp + FORMATS[ss].2) as u64) << FORMATS[ss].0;
+                    let raw_exp = ((exp + FORMATS[ss as usize].2) as u64) << FORMATS[ss as usize].0;
                     let val = ((self.negative() as u64)
                         << (1u64.wrapping_shl(8u32.wrapping_shl(ss as u32) - 1)))
                         | rsig;
@@ -172,7 +174,7 @@ impl CleverFloat {
                     if diffsig < 0 && rsig << (-diffsig) != sig {
                         return Err((FpException::INEXACT, CleverFloat(val, ss)));
                     } else {
-                        Ok(Self(val, ss))
+                        Self(val, ss)
                     }
                 }
             }

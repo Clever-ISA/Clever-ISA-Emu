@@ -4,22 +4,24 @@ use std::{
     slice::SliceIndex,
 };
 
+#[cfg(feature = "float")]
 use half::f16;
 
-use bytemuck::{Pod, Zeroable};
-use num_traits::{float::FloatCore, Float};
-
 use crate::error::{CPUException, CPUResult};
+use bytemuck::{Pod, Zeroable};
 
-#[repr(C, align(128))]
+#[repr(C, align(16))]
 #[derive(Copy, Clone)]
 pub union Vector128 {
     pub i64v2: [u64; 2],
     pub i32v4: [u32; 4],
     pub i16v8: [u16; 8],
     pub i8v16: [u8; 16],
+    #[cfg(feature = "float")]
     pub f64v2: [f64; 2],
+    #[cfg(feature = "float")]
     pub f32v4: [f32; 4],
+    #[cfg(feature = "float")]
     pub f16v2: [f16; 8],
 }
 
@@ -34,34 +36,42 @@ unsafe impl Pod for Vector128 {}
 
 #[derive(Copy, Clone, Zeroable, Pod, Debug)]
 #[non_exhaustive]
-#[repr(C, align(512))]
+#[repr(C, align(2048))]
 pub struct RegsNamed {
     pub gprs: [u64; 16],
     pub ip: i64,
     pub flags: u64,
-    reserved18: u64,
+    pub mode: u64,
     pub fpcw: u64,
     reserved20_23: [u64; 6],
     pub fp: [u64; 8],
+    reserved32_62: [u64; 31],
+    pub undefined63: u64,
+    pub vector: [Vector128; 32],
     pub cr: [u64; 8],
     pub cpuinfo: [u64; 8],
     pub crx: [u64; 4],
-    reserved1: [u64; 5],
     pub mscr: [u64; 6],
-    pub undefined: u64,
-    pub vector: [Vector128; 32],
+    reserved155: u64,
+    pub rdinfo: u64,
+    reserved157_254: [u64; 97],
+    pub undefined255: u64,
 }
+
+const _: () = {
+    assert!(core::mem::size_of::<RegsNamed>() == core::mem::size_of::<RegsRaw>());
+};
 
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub union RegsRaw {
     pub named: RegsNamed,
-    array: [u64; 128],
+    array: [u64; 256],
 }
 
 impl RegsRaw {
-    pub const fn new() {
-        Self { array: [0; 128] }
+    pub const fn new() -> Self {
+        Self { array: [0; 256] }
     }
 }
 
@@ -107,7 +117,7 @@ impl RegsRaw {
     }
 
     #[inline]
-    pub fn from_array(array: [u64; 128]) -> RegsRaw {
+    pub fn from_array(array: [u64; 256]) -> RegsRaw {
         RegsRaw { array }
     }
 

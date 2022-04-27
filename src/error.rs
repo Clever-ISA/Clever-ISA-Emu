@@ -1,3 +1,4 @@
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CPUException {
     Abort,
     Undefined,
@@ -13,7 +14,7 @@ use bytemuck::{Pod, Zeroable};
 
 fake_enum::fake_enum! {
     #[repr(u8)]
-    #[derive(Pod,Zeroable)]
+    #[derive(Pod,Zeroable, Hash)]
     pub enum struct AccessKind{
         Access = 0,
         Write = 1,
@@ -23,7 +24,7 @@ fake_enum::fake_enum! {
     }
 }
 
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Pod, Zeroable)]
 #[repr(C, align(16))]
 pub struct FaultCharacteristics {
     pub pref: i64, // The value page Entry the fault occured at. If cr0.PG=0, this is equal to the page of the fault address
