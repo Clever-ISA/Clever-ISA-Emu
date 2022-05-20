@@ -27,7 +27,7 @@ impl MemoryController {
             Err(CPUException::PageFault(
                 (page as i64) << 12,
                 FaultCharacteristics {
-                    pref: (page as i64) << 12,
+                    pref: (page as u64) << 12,
                     flevel: 0,
                     access_kind: AccessKind::Allocate,
                     ..Zeroable::zeroed()
@@ -55,7 +55,7 @@ impl MemoryController {
             Err(CPUException::PageFault(
                 paddr as i64,
                 FaultCharacteristics {
-                    pref: paddr as i64,
+                    pref: paddr as u64,
                     flevel: 0,
                     access_kind: AccessKind::Allocate,
                     ..Zeroable::zeroed()
@@ -96,7 +96,7 @@ impl MemoryController {
             Err(CPUException::PageFault(
                 paddr as i64,
                 FaultCharacteristics {
-                    pref: paddr as i64,
+                    pref: paddr as u64,
                     flevel: 0,
                     access_kind: AccessKind::Allocate,
                     ..Zeroable::zeroed()

@@ -34,6 +34,15 @@ impl Debug for Vector128 {
 unsafe impl Zeroable for Vector128 {}
 unsafe impl Pod for Vector128 {}
 
+bitflags::bitflags! {
+    #[derive(Zeroable, Pod)]
+    #[repr(transparent)]
+    pub struct Mode : u64 {
+        const XM  = 0x100000000;
+        const XMM = 0x200000000;
+    }
+}
+
 #[derive(Copy, Clone, Zeroable, Pod, Debug)]
 #[non_exhaustive]
 #[repr(C, align(2048))]
@@ -41,13 +50,14 @@ pub struct RegsNamed {
     pub gprs: [u64; 16],
     pub ip: i64,
     pub flags: u64,
-    pub mode: u64,
+    pub mode: Mode,
     pub fpcw: u64,
     reserved20_23: [u64; 6],
     pub fp: [u64; 8],
     reserved32_62: [u64; 31],
     pub undefined63: u64,
-    pub vector: [Vector128; 32],
+    pub vector: [Vector128; 16],
+    reserved96_127: [u64; 32],
     pub cr: [u64; 8],
     pub cpuinfo: [u64; 8],
     pub crx: [u64; 4],
