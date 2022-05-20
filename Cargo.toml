@@ -7,7 +7,7 @@ edition = "2021"
 
 [features]
 
-float = ["dep:half"] # X-float
+float = [] # X-float
 # decimal-fp = ["fp","decimal"]
 vector = [] # X-vector
 float-ext = ["float"] # X-float-ext
@@ -18,7 +18,7 @@ rand = ["dep:rand"] # X-rand
 [dependencies]
 parking_lot = "0.11.1"
 bytemuck = {version="1.7.0",features=["derive","min_const_generics"]}
-half = {version="1.7.1",features=["bytemuck"], optional = true}
+half = {version="1.7.1",features=["bytemuck"]}
 rand = {version="0.8.5", optional = true}
 fake-enum = "0.1.2"
 lru_time_cache = "0.11.11"

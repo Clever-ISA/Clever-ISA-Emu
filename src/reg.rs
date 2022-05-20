@@ -4,6 +4,7 @@ use std::{
     slice::SliceIndex,
 };
 
+use arch_ops::clever::CleverRegister;
 #[cfg(feature = "float")]
 use half::f16;
 
@@ -43,13 +44,30 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    #[derive(Zeroable, Pod)]
+    #[repr(transparent)]
+    pub struct Flags: u64 {
+        const C = 0x01;
+        const Z = 0x02;
+        const V = 0x04;
+        const N = 0x08;
+        const P = 0x10;
+    }
+}
+
+impl Flags {
+    pub const ARITH_FLAGS: Flags = Flags { bits: 0x1F };
+    pub const MOV_FLAGS: Flags = Flags { bits: 0x1A };
+}
+
 #[derive(Copy, Clone, Zeroable, Pod, Debug)]
 #[non_exhaustive]
 #[repr(C, align(2048))]
 pub struct RegsNamed {
     pub gprs: [u64; 16],
     pub ip: i64,
-    pub flags: u64,
+    pub flags: Flags,
     pub mode: Mode,
     pub fpcw: u64,
     reserved20_23: [u64; 6],
@@ -83,6 +101,14 @@ impl RegsRaw {
     pub const fn new() -> Self {
         Self { array: [0; 256] }
     }
+
+    pub const fn user_registers(&self) -> &[u64; 128] {
+        unsafe { &*(self as *const RegsRaw as *const [u64; 128]) }
+    }
+
+    pub fn user_registers_mut(&mut self) -> &mut [u64; 128] {
+        unsafe { &mut *(self as *mut RegsRaw as *mut [u64; 128]) }
+    }
 }
 
 unsafe impl Zeroable for RegsRaw {}
@@ -97,10 +123,25 @@ impl Index<u16> for RegsRaw {
     }
 }
 
+impl Index<CleverRegister> for RegsRaw {
+    type Output = u64;
+    #[inline]
+    fn index(&self, idx: CleverRegister) -> &Self::Output {
+        unsafe { &self.array[idx.0 as usize] }
+    }
+}
+
 impl IndexMut<u16> for RegsRaw {
     #[inline]
     fn index_mut(&mut self, idx: u16) -> &mut Self::Output {
         unsafe { &mut self.array[idx as usize] }
+    }
+}
+
+impl IndexMut<CleverRegister> for RegsRaw {
+    #[inline]
+    fn index_mut(&mut self, idx: CleverRegister) -> &mut Self::Output {
+        unsafe { &mut self.array[idx.0 as usize] }
     }
 }
 

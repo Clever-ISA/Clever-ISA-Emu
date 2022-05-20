@@ -3,7 +3,7 @@ use std::{cell::RefCell, collections::VecDeque, convert::TryInto, sync::Arc};
 use arch_ops::{
     clever::{
         CleverExtension, CleverImmediate, CleverIndex, CleverInstruction, CleverOpcode,
-        CleverOperand, CleverOperandKind, CleverRegister,
+        CleverOperand, CleverOperandKind, CleverRegister, ConditionCode,
     },
     traits::{Address, InsnRead},
 };
@@ -11,9 +11,10 @@ use lru_time_cache::LruCache;
 
 use crate::{
     error::{AccessKind, CPUException, CPUResult, FaultCharacteristics, FaultStatus},
+    io::IOBus,
     mem::{MemoryBus, MemoryController},
     page::PageEntry,
-    reg::{Mode, RegsRaw},
+    reg::{Flags, Mode, RegsRaw},
 };
 
 use bytemuck::{Pod, Zeroable};
@@ -35,12 +36,15 @@ pub enum CpuExecutionMode {
 
 pub struct CPU {
     bus: Arc<MemoryBus>,
+    ioports: IOBus,
     regs: RegsRaw,
     pcache: RefCell<LruCache<i64, u64>>,
     pending_exceptions: VecDeque<CPUException>,
     status: Status,
+    handling_exception: Option<CPUException>,
     // L1 I-cache
     icache: RefCell<LruCache<i64, [u16; 16]>>,
+    pcache_invalid: bool,
 }
 
 #[inline]
@@ -85,15 +89,68 @@ pub struct ItabEntry {
     pub __reserved: u64,
 }
 
+fn do_arith_logic<F: FnOnce(u64, u64) -> (u64, bool)>(
+    a: u64,
+    b: u64,
+    ss: u16,
+    f: F,
+) -> (u64, Flags) {
+    let (res, roverflow) = f(a, b);
+
+    let masked_result = res & ss_to_mask(ss);
+    let delta_sign = (a.wrapping_shr(ss_to_shift(ss) - 1)
+        ^ masked_result.wrapping_shr(ss_to_shift(ss) - 1))
+        != 0;
+
+    let carry = roverflow || (res.wrapping_shr(ss_to_shift(ss)) != 0);
+
+    let mut flags = Flags::empty();
+    if masked_result == 0 {
+        flags |= Flags::Z;
+    }
+    if masked_result.count_ones() & 1 == 1 {
+        flags |= Flags::P;
+    }
+    if masked_result.wrapping_shr(ss_to_shift(ss) - 1) == 1 {
+        flags |= Flags::N;
+    }
+
+    if delta_sign != carry {
+        flags |= Flags::V;
+    }
+
+    if carry {
+        flags |= Flags::C;
+    }
+    (masked_result, flags)
+}
+
+fn compute_flags_from_val(x: u64, ss: u16) -> Flags {
+    let mut flags = Flags::empty();
+    if x == 0 {
+        flags |= Flags::Z;
+    }
+    if x.count_ones() & 1 == 1 {
+        flags |= Flags::P;
+    }
+    if x.wrapping_shr(ss_to_shift(ss) - 1) == 1 {
+        flags |= Flags::N;
+    }
+    flags
+}
+
 impl CPU {
-    pub fn new(mem: Arc<MemoryBus>) -> CPU {
+    pub fn new(mem: Arc<MemoryBus>, io: IOBus) -> CPU {
         CPU {
             bus: mem,
+            ioports: io,
             regs: RegsRaw::new(),
             pcache: RefCell::new(LruCache::with_capacity(1024)),
             pending_exceptions: VecDeque::new(),
             status: Status::Enabled,
             icache: RefCell::new(LruCache::with_capacity(1024)),
+            pcache_invalid: false,
+            handling_exception: None,
         }
     }
 
@@ -333,6 +390,11 @@ impl CPU {
             .with_unlocked_bus(|bus| self.read_in(vaddr, access, bus))
     }
 
+    pub fn read_bytes(&self, vaddr: i64, access: AccessKind, buf: &mut [u8]) -> CPUResult<()> {
+        self.bus
+            .with_unlocked_bus(|bus| self.read_bytes_in(vaddr, access, buf, bus))
+    }
+
     pub fn read_aligned<T: Pod>(&self, vaddr: i64, access: AccessKind) -> CPUResult<T> {
         self.bus
             .with_unlocked_bus(|bus| self.read_aligned_in(vaddr, access, bus))
@@ -341,6 +403,11 @@ impl CPU {
     pub fn write<T: Pod>(&self, vaddr: i64, val: T) -> CPUResult<()> {
         self.bus
             .with_locked_bus(|bus| self.write_in(vaddr, bus, val))
+    }
+
+    pub fn write_bytes(&self, vaddr: i64, buf: &[u8]) -> CPUResult<()> {
+        self.bus
+            .with_locked_bus(|bus| self.write_bytes_in(vaddr, buf, bus))
     }
 
     pub fn write_aligned<T: Pod>(&self, vaddr: i64, val: T) -> CPUResult<()> {
@@ -382,7 +449,17 @@ impl CPU {
     }
 
     pub fn poll_exceptions(&mut self) -> CPUResult<()> {
-        if let Some(except) = self.pending_exceptions.pop_front() {
+        if self.status == Status::Interrupted {
+            self.status = Status::Active;
+            return Ok(());
+        }
+        if let Some(mut except) = self.pending_exceptions.pop_front() {
+            match self.handling_exception {
+                Some(CPUException::Abort | CPUException::Reset) => except = CPUException::Reset,
+                Some(_) => except = CPUException::Abort,
+                None => {}
+            }
+            self.handling_exception = Some(except);
             match (|| -> CPUResult<()> {
                 let itab_addr = self.regs.cr[6] as i64;
                 let index = match except {
@@ -422,7 +499,7 @@ impl CPU {
                     CPUException::Reset => Err(CPUException::Reset)?,
                 };
                 let extent = self.read_aligned::<u64>(itab_addr, AccessKind::Access)?;
-                if extent < (index * 32) {
+                if extent < ((index + 32) * 32) {
                     Err(CPUException::Abort)?
                 }
 
@@ -449,6 +526,7 @@ impl CPU {
                     self.status = Status::Interrupted;
                     Ok(())
                 }
+                Err(CPUException::Reset) => Err(CPUException::Reset),
                 Err(_) if except == CPUException::Abort => Err(CPUException::Reset),
                 Err(_) => Err(CPUException::Abort),
             }
@@ -511,7 +589,9 @@ impl CPU {
                         | CleverOpcode::Bsto { .. }
                         | CleverOpcode::Bsca { .. }
                         | CleverOpcode::Bcmp { .. }
-                        | CleverOpcode::Btst { .. },
+                        | CleverOpcode::Btst { .. }
+                        | CleverOpcode::In { .. }
+                        | CleverOpcode::Out { .. },
                     )
                     | (
                         CleverOpcode::Vec { .. },
@@ -694,9 +774,365 @@ impl CPU {
                         }
                         _ => unsafe { core::hint::unreachable_unchecked() },
                     };
+                    ops.push(op);
                 }
                 Ok(CleverInstruction::new(opc, ops))
             }
+        }
+    }
+
+    fn check_read(&self, op: &CleverOperand) -> CPUResult<()> {
+        match op {
+            CleverOperand::Register { size, reg } => {
+                self.check_extension(reg.extension().ok_or(CPUException::Undefined)?)?;
+                if reg.0 < 128 {
+                    Ok(())
+                } else if (148..155).contains(&reg.0) {
+                    Err(CPUException::Undefined)
+                } else if !self.regs.mode.contains(Mode::XM) {
+                    Ok(())
+                } else if (136..144).contains(&reg.0) {
+                    let off = reg.0 - 136;
+                    let bit = 1u64 << off;
+                    if (self.regs.cr[7] & bit) != 0 {
+                        Err(CPUException::SystemProtection(0))
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    Err(CPUException::SystemProtection(0))
+                }
+            }
+            CleverOperand::Indirect { .. } => Ok(()),
+            CleverOperand::VecPair { size, lo } => {
+                self.check_extension(lo.extension().ok_or(CPUException::Undefined)?)?;
+
+                if lo.0 & 1 != 0 {
+                    Err(CPUException::Undefined)
+                } else if !(64..96).contains(&lo.0) {
+                    Err(CPUException::Undefined)
+                } else {
+                    Ok(())
+                }
+            }
+            CleverOperand::Immediate(_) => Ok(()),
+        }
+    }
+
+    fn check_write(&self, op: &CleverOperand) -> CPUResult<()> {
+        match op {
+            CleverOperand::Register { reg, .. } => {
+                self.check_extension(reg.extension().ok_or(CPUException::Undefined)?)?;
+                match *reg {
+                    CleverRegister::ip
+                    | CleverRegister::mode
+                    | CleverRegister(136..=143)
+                    | CleverRegister::rdinfo => return Err(CPUException::Undefined)?,
+                    _ => (),
+                }
+                if reg.0 < 128 {
+                    Ok(())
+                } else if (148..155).contains(&reg.0) {
+                    Err(CPUException::Undefined)
+                } else if !self.regs.mode.contains(Mode::XM) {
+                    Ok(())
+                } else if (136..144).contains(&reg.0) {
+                    Err(CPUException::Undefined)
+                } else {
+                    Err(CPUException::SystemProtection(0))
+                }
+            }
+            CleverOperand::Indirect { .. } => Ok(()),
+            CleverOperand::VecPair { lo, .. } => {
+                self.check_extension(lo.extension().ok_or(CPUException::Undefined)?)?;
+
+                if lo.0 & 1 != 0 {
+                    Err(CPUException::Undefined)
+                } else if !(64..96).contains(&lo.0) {
+                    Err(CPUException::Undefined)
+                } else {
+                    Ok(())
+                }
+            }
+            CleverOperand::Immediate(
+                CleverImmediate::LongMem(_, _, _) | CleverImmediate::LongMemRel(_, _, _),
+            ) => Ok(()),
+            CleverOperand::Immediate(imm) => Err(CPUException::Undefined),
+        }
+    }
+
+    fn check_memory(&self, op: &CleverOperand) -> CPUResult<()> {
+        match op {
+            CleverOperand::Indirect { .. } => Ok(()),
+            CleverOperand::Immediate(
+                CleverImmediate::LongMem(_, _, _) | CleverImmediate::LongMemRel(_, _, _),
+            ) => Ok(()),
+            _ => Err(CPUException::Undefined),
+        }
+    }
+
+    fn check_register_arith(&self, op: &CleverOperand) -> CPUResult<()> {
+        match op {
+            CleverOperand::Register { reg, .. } => {
+                if !((0..16).contains(&reg.0) || (64..96).contains(&reg.0)) {
+                    Err(CPUException::Undefined)
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn check_only_one_memory(&self, ops: &[CleverOperand]) -> CPUResult<()> {
+        let mut has_mem = false;
+        for op in ops {
+            match op {
+                CleverOperand::Indirect { .. }
+                | CleverOperand::Immediate(
+                    CleverImmediate::LongMem(_, _, _) | CleverImmediate::LongMemRel(_, _, _),
+                ) => {
+                    if has_mem {
+                        return Err(CPUException::Undefined);
+                    }
+                    has_mem = true
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn read_u64_by_size_in(&self, op: &CleverOperand, bus: &MemoryController) -> CPUResult<u64> {
+        match op {
+            CleverOperand::Register { size, reg } => {
+                let ss = match size {
+                    8 => 0,
+                    16 => 1,
+                    32 => 2,
+                    64 => 3,
+                    size => unreachable!("Invalid register size {:?}", size),
+                };
+                let raw_val = self.regs[reg.0 as u16];
+
+                Ok(raw_val & ss_to_mask(ss))
+            }
+            CleverOperand::VecPair { .. } => {
+                panic!("Cannot use read_u64_by_size to read a vector operand")
+            }
+            CleverOperand::Immediate(CleverImmediate::Short(val)) => Ok((*val) as u64),
+            CleverOperand::Immediate(CleverImmediate::ShortRel(val)) => {
+                Ok(((*val) as i64).wrapping_add(self.regs.ip) as u64)
+            }
+            CleverOperand::Immediate(CleverImmediate::Long(_, val)) => Ok(*val), // already masked
+            CleverOperand::Immediate(CleverImmediate::LongRel(_, val)) => {
+                Ok(val.wrapping_add(self.regs.ip) as u64)
+            }
+            CleverOperand::Immediate(CleverImmediate::LongMem(_, Address::Abs(val), memsize)) => {
+                if *memsize > 64 {
+                    panic!("Cannot use read_u64_by_size to read a vector operand")
+                }
+                let byte_count = ((*memsize) >> 3) as usize;
+                let addr = u64::try_from(*val).unwrap() as i64;
+                let mut bytes = [0u8; 8];
+                self.read_bytes_in(addr, AccessKind::Access, &mut bytes[..byte_count], bus)?;
+
+                Ok(u64::from_le_bytes(bytes))
+            }
+            CleverOperand::Immediate(CleverImmediate::LongMemRel(
+                _,
+                Address::Disp(disp),
+                memsize,
+            )) => {
+                if *memsize > 64 {
+                    panic!("Cannot use read_u64_by_size to read a vector operand")
+                }
+                let byte_count = ((*memsize) >> 3) as usize;
+                let addr = (*disp) + self.regs.ip;
+                let mut bytes = [0u8; 8];
+                self.read_bytes_in(addr, AccessKind::Access, &mut bytes[..byte_count], bus)?;
+
+                Ok(u64::from_le_bytes(bytes))
+            }
+            CleverOperand::Indirect {
+                size,
+                base,
+                scale,
+                index,
+            } => {
+                let byte_count = ((*size) >> 3) as usize;
+                let mut addr = (self.regs[base.0 as u16] as i64)
+                    + (*scale as i64)
+                        * match index {
+                            CleverIndex::Abs(v) => *v as i64,
+                            CleverIndex::Register(idx) => self.regs[idx.0 as u16] as i64,
+                        };
+                let mut bytes = [0u8; 8];
+                self.read_bytes_in(addr, AccessKind::Access, &mut bytes[..byte_count], bus)?;
+
+                Ok(u64::from_le_bytes(bytes))
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn read_u64_by_size(&self, op: &CleverOperand) -> CPUResult<u64> {
+        self.bus
+            .with_unlocked_bus(|bus| self.read_u64_by_size_in(op, bus))
+    }
+
+    fn write_u64_by_size_in(
+        &mut self,
+        op: &CleverOperand,
+        bus: &mut MemoryController,
+        val: u64,
+    ) -> CPUResult<()> {
+        match op {
+            CleverOperand::Register { size, reg } => {
+                let ss = match size {
+                    8 => 0,
+                    16 => 1,
+                    32 => 2,
+                    64 => 3,
+                    size => unreachable!("Invalid register size {:?}", size),
+                };
+                let mut raw_val = val & ss_to_mask(ss);
+
+                match *reg {
+                    CleverRegister::flags => {
+                        let cflags = self.regs.flags.bits() & !ss_to_mask(ss);
+                        raw_val = cflags | (raw_val & Flags::all().bits());
+                    }
+                    CleverRegister::fpcw => {
+                        if (raw_val & ((1 << 26) - 1)) != 0 {
+                            return Err(CPUException::Undefined);
+                        }
+                    }
+                    CleverRegister::cr0 => {
+                        let mut mask = 0x3f;
+                        #[cfg(feature = "float")]
+                        {
+                            mask |= 0xC0;
+                        }
+                        #[cfg(feature = "vector")]
+                        {
+                            mask |= 0x100;
+                        }
+                        #[cfg(feature = "rand")]
+                        {
+                            mask |= 0x300;
+                        }
+
+                        if (raw_val & mask) != 0 {
+                            return Err(CPUException::Undefined);
+                        }
+                        if (raw_val & 1) != 0 {
+                            self.pcache_invalid = true;
+                        }
+                    }
+                    CleverRegister::cr3 => {
+                        self.pcache_invalid = true;
+                    }
+                    _ => {}
+                }
+
+                self.regs[reg.0 as u16] = raw_val;
+
+                Ok(())
+            }
+            CleverOperand::VecPair { .. } => {
+                panic!("Cannot use read_u64_by_size to read a vector operand")
+            }
+            CleverOperand::Immediate(CleverImmediate::LongMem(_, Address::Abs(val), memsize)) => {
+                if *memsize > 64 {
+                    panic!("Cannot use read_u64_by_size to read a vector operand");
+                }
+                let byte_count = ((*memsize) >> 3) as usize;
+                let addr = u64::try_from(*val).unwrap() as i64;
+                let bytes = val.to_le_bytes();
+                self.write_bytes_in(addr, &bytes[..byte_count], bus)
+            }
+            CleverOperand::Immediate(CleverImmediate::LongMemRel(
+                _,
+                Address::Disp(disp),
+                memsize,
+            )) => {
+                if *memsize > 64 {
+                    panic!("Cannot use read_u64_by_size to read a vector operand")
+                }
+                let byte_count = ((*memsize) >> 3) as usize;
+                let addr = (*disp) + self.regs.ip;
+                let bytes = val.to_le_bytes();
+                self.write_bytes_in(addr, &bytes[..byte_count], bus)
+            }
+            CleverOperand::Indirect {
+                size,
+                base,
+                scale,
+                index,
+            } => {
+                let byte_count = ((*size) >> 3) as usize;
+                let mut addr = (self.regs[base.0 as u16] as i64)
+                    + (*scale as i64)
+                        * match index {
+                            CleverIndex::Abs(v) => *v as i64,
+                            CleverIndex::Register(idx) => self.regs[idx.0 as u16] as i64,
+                        };
+                let bytes = val.to_le_bytes();
+                self.write_bytes_in(addr, &bytes[..byte_count], bus)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn write_u64_by_size(&mut self, op: &CleverOperand, val: u64) -> CPUResult<()> {
+        let bus = self.bus.clone();
+
+        bus.with_locked_bus(|bus| self.write_u64_by_size_in(op, bus, val))
+    }
+
+    fn compute_addr(&self, op: &CleverOperand) -> CPUResult<i64> {
+        match op {
+            CleverOperand::Indirect {
+                base, scale, index, ..
+            } => Ok(self.regs[*base] as i64
+                + ((*scale as i64)
+                    * match index {
+                        CleverIndex::Abs(val) => *val as i64,
+                        CleverIndex::Register(reg) => self.regs[*reg] as i64,
+                    })),
+            CleverOperand::Immediate(CleverImmediate::LongMem(_, Address::Abs(addr), _)) => {
+                Ok(*addr as u64 as i64)
+            }
+            CleverOperand::Immediate(CleverImmediate::LongMemRel(_, Address::Disp(addr), _)) => {
+                Ok((*addr) + self.regs.ip)
+            }
+            _ => return Err(CPUException::Undefined),
+        }
+    }
+
+    fn test_cc(&self, cc: ConditionCode, flags: Flags) -> bool {
+        match cc {
+            ConditionCode::Parity => flags.contains(Flags::P),
+            ConditionCode::Carry => flags.contains(Flags::C),
+            ConditionCode::Overflow => flags.contains(Flags::V),
+            ConditionCode::Zero => flags.contains(Flags::Z),
+            ConditionCode::LessThan => flags.contains(Flags::V) != flags.contains(Flags::N),
+            ConditionCode::LessEq => {
+                (flags.contains(Flags::V) != flags.contains(Flags::N)) || flags.contains(Flags::Z)
+            }
+            ConditionCode::BelowEq => flags.contains(Flags::C) || flags.contains(Flags::Z),
+            ConditionCode::Minus => flags.contains(Flags::N),
+            ConditionCode::Plus => flags.contains(Flags::P),
+            ConditionCode::Above => !(flags.contains(Flags::C) || flags.contains(Flags::Z)),
+            ConditionCode::Greater => {
+                (flags.contains(Flags::V) == flags.contains(Flags::N)) && !flags.contains(Flags::Z)
+            }
+            ConditionCode::GreaterEq => flags.contains(Flags::V) == flags.contains(Flags::N),
+            ConditionCode::NotZero => !flags.contains(Flags::Z),
+            ConditionCode::NoOverflow => !flags.contains(Flags::V),
+            ConditionCode::NoCarry => !flags.contains(Flags::C),
+            ConditionCode::NoParity => !flags.contains(Flags::P),
         }
     }
 
@@ -704,13 +1140,946 @@ impl CPU {
         self.poll_exceptions()?;
         let insn = self.fetch_insn()?;
 
+        if let Some(CleverOpcode::Vec { .. }) = insn.prefix() {
+            todo!("Vec prefix needs special handling")
+        }
+
+        match insn.opcode() {
+            CleverOpcode::Add { lock, flags } => {
+                self.check_only_one_memory(insn.operands())?;
+                let [dest, src] = match insn.operands() {
+                    [dest, src] => [dest, src],
+                    _ => unreachable!(),
+                };
+                self.check_register_arith(dest)?;
+                self.check_register_arith(dest)?;
+                self.check_write(dest)?;
+                self.check_read(src)?;
+                let dest_ss = dest.size_ss().unwrap();
+                let calc_ss = dest.size_ss().unwrap().max(src.size_ss().unwrap());
+                let res_flags = if lock {
+                    let bus = self.bus.clone();
+                    bus.with_locked_bus(|bus| -> CPUResult<Flags> {
+                        self.check_memory(dest)?;
+                        let (a, b) = (
+                            self.read_u64_by_size_in(dest, bus)?,
+                            self.read_u64_by_size_in(src, bus)?,
+                        );
+                        let (res, flags) = do_arith_logic(a, b, calc_ss, u64::overflowing_add);
+                        self.write_u64_by_size_in(dest, bus, ss_to_mask(dest_ss) & res)?;
+                        Ok(flags)
+                    })?
+                } else {
+                    let (a, b) = (self.read_u64_by_size(dest)?, self.read_u64_by_size(src)?);
+                    let (res, flags) = do_arith_logic(a, b, dest_ss, u64::overflowing_add);
+                    self.write_u64_by_size(dest, ss_to_mask(dest_ss) & res)?;
+                    flags
+                };
+
+                if flags {
+                    self.regs.flags &= !(Flags::ARITH_FLAGS);
+                    self.regs.flags |= res_flags;
+                }
+            }
+            CleverOpcode::Sub { lock, flags } => {
+                self.check_only_one_memory(insn.operands())?;
+                let [dest, src] = match insn.operands() {
+                    [dest, src] => [dest, src],
+                    _ => unreachable!(),
+                };
+                self.check_register_arith(dest)?;
+                self.check_register_arith(dest)?;
+                self.check_write(dest)?;
+                self.check_read(src)?;
+                let dest_ss = dest.size_ss().unwrap();
+                let calc_ss = dest.size_ss().unwrap().max(src.size_ss().unwrap());
+                let res_flags = if lock {
+                    let bus = self.bus.clone();
+                    bus.with_locked_bus(|bus| -> CPUResult<Flags> {
+                        self.check_memory(dest)?;
+                        let (a, b) = (
+                            self.read_u64_by_size_in(dest, bus)?,
+                            self.read_u64_by_size_in(src, bus)?,
+                        );
+                        let (res, flags) = do_arith_logic(a, b, dest_ss, u64::overflowing_sub);
+                        self.write_u64_by_size_in(dest, bus, res)?;
+                        Ok(flags)
+                    })?
+                } else {
+                    let (a, b) = (self.read_u64_by_size(dest)?, self.read_u64_by_size(src)?);
+                    let (res, flags) = do_arith_logic(a, b, dest_ss, u64::overflowing_sub);
+                    self.write_u64_by_size(dest, res)?;
+                    flags
+                };
+
+                if flags {
+                    self.regs.flags &= !(Flags::ARITH_FLAGS);
+                    self.regs.flags |= res_flags;
+                }
+            }
+            CleverOpcode::And { lock, flags } => {
+                self.check_only_one_memory(insn.operands())?;
+                let [dest, src] = match insn.operands() {
+                    [dest, src] => [dest, src],
+                    _ => unreachable!(),
+                };
+                self.check_register_arith(dest)?;
+                self.check_register_arith(dest)?;
+                self.check_write(dest)?;
+                self.check_read(src)?;
+                let dest_ss = dest.size_ss().unwrap();
+                let calc_ss = dest.size_ss().unwrap().max(src.size_ss().unwrap());
+                let res_flags = if lock {
+                    let bus = self.bus.clone();
+                    bus.with_locked_bus(|bus| -> CPUResult<Flags> {
+                        self.check_memory(dest)?;
+                        let (a, b) = (
+                            self.read_u64_by_size_in(dest, bus)?,
+                            self.read_u64_by_size_in(src, bus)?,
+                        );
+                        let (res, flags) = do_arith_logic(a, b, dest_ss, |a, b| (a & b, false));
+                        self.write_u64_by_size_in(dest, bus, res)?;
+                        Ok(flags)
+                    })?
+                } else {
+                    let (a, b) = (self.read_u64_by_size(dest)?, self.read_u64_by_size(src)?);
+                    let (res, flags) = do_arith_logic(a, b, dest_ss, |a, b| (a & b, false));
+                    self.write_u64_by_size(dest, ss_to_mask(dest_ss) & res)?;
+                    flags
+                };
+
+                if flags {
+                    self.regs.flags &= !(Flags::ARITH_FLAGS);
+                    self.regs.flags |= res_flags;
+                }
+            }
+            CleverOpcode::Or { lock, flags } => {
+                self.check_only_one_memory(insn.operands())?;
+                let [dest, src] = match insn.operands() {
+                    [dest, src] => [dest, src],
+                    _ => unreachable!(),
+                };
+                self.check_register_arith(dest)?;
+                self.check_register_arith(dest)?;
+                self.check_write(dest)?;
+                self.check_read(src)?;
+                let dest_ss = dest.size_ss().unwrap();
+                let calc_ss = dest.size_ss().unwrap().max(src.size_ss().unwrap());
+                let res_flags = if lock {
+                    let bus = self.bus.clone();
+                    bus.with_locked_bus(|bus| -> CPUResult<Flags> {
+                        self.check_memory(dest)?;
+                        let (a, b) = (
+                            self.read_u64_by_size_in(dest, bus)?,
+                            self.read_u64_by_size_in(src, bus)?,
+                        );
+                        let (res, flags) = do_arith_logic(a, b, dest_ss, |a, b| (a | b, false));
+                        self.write_u64_by_size_in(dest, bus, ss_to_mask(dest_ss) & res)?;
+                        Ok(flags)
+                    })?
+                } else {
+                    let (a, b) = (self.read_u64_by_size(dest)?, self.read_u64_by_size(src)?);
+                    let (res, flags) = do_arith_logic(a, b, dest_ss, |a, b| (a | b, false));
+                    self.write_u64_by_size(dest, ss_to_mask(dest_ss) & res)?;
+                    flags
+                };
+
+                if flags {
+                    self.regs.flags &= !(Flags::ARITH_FLAGS);
+                    self.regs.flags |= res_flags;
+                }
+            }
+            CleverOpcode::Xor { lock, flags } => {
+                self.check_only_one_memory(insn.operands())?;
+                let [dest, src] = match insn.operands() {
+                    [dest, src] => [dest, src],
+                    _ => unreachable!(),
+                };
+                self.check_register_arith(dest)?;
+                self.check_register_arith(dest)?;
+                self.check_write(dest)?;
+                self.check_read(src)?;
+                let dest_ss = dest.size_ss().unwrap();
+                let calc_ss = dest.size_ss().unwrap().max(src.size_ss().unwrap());
+                let res_flags = if lock {
+                    let bus = self.bus.clone();
+                    bus.with_locked_bus(|bus| -> CPUResult<Flags> {
+                        self.check_memory(dest)?;
+                        let (a, b) = (
+                            self.read_u64_by_size_in(dest, bus)?,
+                            self.read_u64_by_size_in(src, bus)?,
+                        );
+                        let (res, flags) = do_arith_logic(a, b, dest_ss, |a, b| (a ^ b, false));
+                        self.write_u64_by_size_in(dest, bus, ss_to_mask(dest_ss) & res)?;
+                        Ok(flags)
+                    })?
+                } else {
+                    let (a, b) = (self.read_u64_by_size(dest)?, self.read_u64_by_size(src)?);
+                    let (res, flags) = do_arith_logic(a, b, dest_ss, |a, b| (a ^ b, false));
+                    self.write_u64_by_size(dest, ss_to_mask(dest_ss) & res)?;
+                    flags
+                };
+
+                if flags {
+                    self.regs.flags &= !(Flags::ARITH_FLAGS);
+                    self.regs.flags |= res_flags;
+                }
+            }
+            CleverOpcode::Mov => {
+                self.check_only_one_memory(insn.operands())?;
+                let [dest, src] = match insn.operands() {
+                    [dest, src] => [dest, src],
+                    _ => unreachable!(),
+                };
+                self.check_write(dest)?;
+                self.check_read(src)?;
+                let val = self.read_u64_by_size(src)?;
+                let ss = src.size_ss().unwrap();
+                let res_flags = compute_flags_from_val(val, ss);
+                self.regs.flags &= !(Flags::MOV_FLAGS);
+                self.regs.flags |= res_flags;
+                self.write_u64_by_size(dest, val)?;
+            }
+            CleverOpcode::MovRD { r } => {
+                let [src] = match insn.operands() {
+                    [src] => [src],
+                    ops => unreachable!("invalid operands {:?}", ops),
+                };
+                self.check_read(src)?;
+                let val = self.read_u64_by_size(src)?;
+                let ss = src.size_ss().unwrap_or(1); // Short-imm unsigned is ss=1
+                let res_flags = compute_flags_from_val(val, ss);
+                self.regs.flags &= !(Flags::MOV_FLAGS);
+                self.regs.flags |= res_flags;
+                self.regs[r] = val;
+            }
+            CleverOpcode::MovRS { r } => {
+                let [dest] = match insn.operands() {
+                    [dest] => [dest],
+                    _ => unreachable!(),
+                };
+                self.check_write(dest)?;
+                let val = self.regs[r];
+                let res_flags = compute_flags_from_val(val, 3);
+                self.regs.flags &= !(Flags::MOV_FLAGS);
+                self.regs.flags |= res_flags;
+
+                self.write_u64_by_size(dest, val)?;
+            }
+            CleverOpcode::Lea => {
+                self.check_only_one_memory(insn.operands())?;
+                let [dest, src] = match insn.operands() {
+                    [dest, src] => [dest, src],
+                    _ => unreachable!(),
+                };
+                self.check_write(dest)?;
+                self.check_memory(src)?;
+
+                let val = self.compute_addr(src)? as u64;
+                self.write_u64_by_size(dest, val)?;
+            }
+            CleverOpcode::LeaRD { r } => {
+                let [src] = match insn.operands() {
+                    [src] => [src],
+                    _ => unreachable!(),
+                };
+                let val = self.compute_addr(src)? as u64;
+                self.regs[r] = val;
+            }
+            CleverOpcode::Nop10 { .. }
+            | CleverOpcode::Nop11 { .. }
+            | CleverOpcode::Nop12 { .. }
+            | CleverOpcode::Nop13 { .. } => { /*no-op */ }
+            CleverOpcode::Push => {
+                let [src] = match insn.operands() {
+                    [src] => [src],
+                    _ => unreachable!(),
+                };
+
+                self.check_read(src)?;
+                let val = self.read_u64_by_size(src)?;
+                self.push(val)?;
+            }
+            CleverOpcode::Pop => {
+                let [dest] = match insn.operands() {
+                    [dest] => [dest],
+                    _ => unreachable!(),
+                };
+
+                self.check_write(dest)?;
+                let val = self.pop()?;
+                self.write_u64_by_size(dest, val)?;
+            }
+            CleverOpcode::PushR { r } => {
+                let val = self.regs[r];
+                self.push(val)?;
+            }
+            CleverOpcode::PopR { r } => {
+                let val = self.pop()?;
+                self.regs[r] = val;
+            }
+            CleverOpcode::Stogpr => {
+                let [dest] = match insn.operands() {
+                    [dest] => [dest],
+                    _ => unreachable!(),
+                };
+                let addr = self.compute_addr(dest)?;
+                self.write(addr, self.regs.gprs)?;
+            }
+            CleverOpcode::Stoar => {
+                let [dest] = match insn.operands() {
+                    [dest] => [dest],
+                    _ => unreachable!(),
+                };
+                let addr = self.compute_addr(dest)?;
+                self.write(addr, *self.regs.user_registers())?;
+            }
+            CleverOpcode::Rstogpr => {
+                let [src] = match insn.operands() {
+                    [src] => [src],
+                    _ => unreachable!(),
+                };
+                let addr = self.compute_addr(src)?;
+                self.regs.gprs = self.read(addr, AccessKind::Access)?;
+            }
+            CleverOpcode::Rstoar => {
+                let [src] = match insn.operands() {
+                    [src] => [src],
+                    _ => unreachable!(),
+                };
+                let addr = self.compute_addr(src)?;
+                let mut tmp_regs: [u64; 128] = self.read(addr, AccessKind::Access)?;
+
+                for i in 16..128 {
+                    if tmp_regs[i] != self.regs.user_registers()[i] {
+                        self.check_extension(
+                            CleverRegister(i as u8)
+                                .extension()
+                                .ok_or(CPUException::Undefined)?,
+                        )?;
+                    }
+                }
+
+                tmp_regs[16] = self.regs.ip as u64;
+                tmp_regs[18] = self.regs.mode.bits();
+
+                *self.regs.user_registers_mut() = tmp_regs;
+            }
+            CleverOpcode::Pushgpr => {
+                self.push(self.regs.gprs)?;
+            }
+            CleverOpcode::Pushar => {
+                self.push(*self.regs.user_registers())?;
+            }
+            CleverOpcode::Popgpr => {
+                self.regs.gprs = self.pop()?;
+            }
+            CleverOpcode::Popar => {
+                let mut tmp_regs: [u64; 128] = self.pop()?;
+                for i in 16..128 {
+                    if tmp_regs[i] != self.regs.user_registers()[i] {
+                        self.check_extension(
+                            CleverRegister(i as u8)
+                                .extension()
+                                .ok_or(CPUException::Undefined)?,
+                        )?;
+                    }
+                }
+
+                tmp_regs[16] = self.regs.ip as u64;
+                tmp_regs[18] = self.regs.mode.bits();
+
+                *self.regs.user_registers_mut() = tmp_regs;
+            }
+            CleverOpcode::Movsx { flags } => {
+                self.check_only_one_memory(insn.operands())?;
+                let [dest, src] = match insn.operands() {
+                    [dest, src] => [dest, src],
+                    _ => unreachable!(),
+                };
+                self.check_write(dest)?;
+                self.check_read(src)?;
+                let val = self.read_u64_by_size(src)?;
+                let ss = src.size_ss();
+
+                let ext_val = match ss {
+                    Some(ss) => signex_ss(ss, val),
+                    None => (((val as i64) << 52) >> 52) as u64,
+                };
+                let res_flags = compute_flags_from_val(ext_val, dest.size_ss().unwrap());
+                if flags {
+                    self.regs.flags &= !(Flags::MOV_FLAGS);
+                    self.regs.flags |= res_flags;
+                }
+                self.write_u64_by_size(dest, ext_val)?;
+            }
+            CleverOpcode::Bswap { flags } => {
+                self.check_only_one_memory(insn.operands())?;
+                let [dest, src] = match insn.operands() {
+                    [dest, src] => [dest, src],
+                    _ => unreachable!(),
+                };
+                self.check_write(dest)?;
+                self.check_read(src)?;
+                let (ss1, ss2) = (dest.size_ss(), src.size_ss());
+                if ss1 != ss2 {
+                    return Err(CPUException::Undefined);
+                }
+                let ss = ss1.unwrap();
+                let val = self.read_u64_by_size(src)?;
+                let val = val.swap_bytes() >> (64 - ss_to_shift(ss));
+                let res_flags = compute_flags_from_val(val, ss);
+                if flags {
+                    self.regs.flags &= !(Flags::MOV_FLAGS);
+                    self.regs.flags |= res_flags;
+                }
+                self.write_u64_by_size(dest, val)?;
+            }
+            CleverOpcode::Bcpy { ss } => {
+                let mut src_addr = self.regs.gprs[4] as i64;
+                let mut dest_addr = self.regs.gprs[5] as i64;
+                let mut count = self.regs.gprs[1];
+                let mut flags = self.regs.flags;
+                let res = (|| -> CPUResult<()> {
+                    match insn.prefix() {
+                        Some(CleverOpcode::Repbi { cc }) => {
+                            let mut val = [0u8; 8];
+                            let size_count = 1 << ss;
+                            if !self.test_cc(cc, flags) {
+                                return Ok(());
+                            }
+                            self.read_bytes(src_addr, AccessKind::Access, &mut val[..size_count])?;
+                            self.write_bytes(dest_addr, &val[..size_count])?;
+                            src_addr = src_addr.wrapping_add(size_count as i64);
+                            dest_addr = dest_addr.wrapping_add(size_count as i64);
+                            flags &= !Flags::MOV_FLAGS;
+                            flags |= compute_flags_from_val(u64::from_le_bytes(val), ss);
+                            count = count.wrapping_sub(1);
+                            while count > 0 {
+                                if !self.test_cc(cc, flags) {
+                                    return Ok(());
+                                }
+                                self.read_bytes(
+                                    src_addr,
+                                    AccessKind::Access,
+                                    &mut val[..size_count],
+                                )?;
+                                self.write_bytes(dest_addr, &val[..size_count])?;
+                                src_addr = src_addr.wrapping_add(size_count as i64);
+                                dest_addr = dest_addr.wrapping_add(size_count as i64);
+                                flags &= !Flags::MOV_FLAGS;
+                                flags |= compute_flags_from_val(u64::from_le_bytes(val), ss);
+                                count = count.wrapping_sub(1);
+                            }
+                            Ok(())
+                        }
+                        Some(CleverOpcode::Repbc) => {
+                            let mut val = [0u8; 8];
+                            let size_count = 1 << ss;
+                            self.read_bytes(src_addr, AccessKind::Access, &mut val[..size_count])?;
+                            self.write_bytes(dest_addr, &val[..size_count])?;
+                            src_addr = src_addr.wrapping_add(size_count as i64);
+                            dest_addr = dest_addr.wrapping_add(size_count as i64);
+                            flags &= !Flags::MOV_FLAGS;
+                            flags |= compute_flags_from_val(u64::from_le_bytes(val), ss);
+                            count = count.wrapping_sub(1);
+                            while count > 0 {
+                                self.read_bytes(
+                                    src_addr,
+                                    AccessKind::Access,
+                                    &mut val[..size_count],
+                                )?;
+                                self.write_bytes(dest_addr, &val[..size_count])?;
+                                src_addr = src_addr.wrapping_add(size_count as i64);
+                                dest_addr = dest_addr.wrapping_add(size_count as i64);
+                                flags &= !Flags::MOV_FLAGS;
+                                flags |= compute_flags_from_val(u64::from_le_bytes(val), ss);
+                                count = count.wrapping_sub(1);
+                            }
+                            Ok(())
+                        }
+                        _ => {
+                            let mut val = [0u8; 8];
+                            let size_count = 1 << ss;
+                            self.read_bytes(src_addr, AccessKind::Access, &mut val[..size_count])?;
+                            self.write_bytes(dest_addr, &val[..size_count])?;
+                            src_addr = src_addr.wrapping_add(size_count as i64);
+                            dest_addr = dest_addr.wrapping_add(size_count as i64);
+                            flags &= !Flags::MOV_FLAGS;
+                            flags |= compute_flags_from_val(u64::from_le_bytes(val), ss);
+                            Ok(())
+                        }
+                    }
+                })();
+                // If an exception occurs after some operations, update the registers anyways
+                self.regs.flags = flags;
+                self.regs.gprs[1] = count;
+                self.regs.gprs[4] = src_addr as u64;
+                self.regs.gprs[5] = dest_addr as u64;
+                res?;
+            }
+            CleverOpcode::Bsto { ss } => {
+                let mut src = self.regs.gprs[0];
+                let val = src.to_le_bytes();
+                let mut dest_addr = self.regs.gprs[5] as i64;
+                let mut count = self.regs.gprs[1];
+                let mut flags = self.regs.flags;
+                let res = (|| -> CPUResult<()> {
+                    match insn.prefix() {
+                        Some(CleverOpcode::Repbi { cc }) => {
+                            let size_count = 1 << ss;
+                            if !self.test_cc(cc, flags) {
+                                return Ok(());
+                            }
+                            self.write_bytes(dest_addr, &val[..size_count])?;
+                            dest_addr = dest_addr.wrapping_add(size_count as i64);
+                            flags &= !Flags::MOV_FLAGS;
+                            flags |= compute_flags_from_val(u64::from_le_bytes(val), ss);
+                            count = count.wrapping_sub(1);
+                            while count > 0 {
+                                if !self.test_cc(cc, flags) {
+                                    return Ok(());
+                                }
+                                self.write_bytes(dest_addr, &val[..size_count])?;
+                                dest_addr = dest_addr.wrapping_add(size_count as i64);
+                                flags &= !Flags::MOV_FLAGS;
+                                flags |= compute_flags_from_val(u64::from_le_bytes(val), ss);
+                                count = count.wrapping_sub(1);
+                            }
+                            Ok(())
+                        }
+                        Some(CleverOpcode::Repbc) => {
+                            let size_count = 1 << ss;
+                            self.write_bytes(dest_addr, &val[..size_count])?;
+                            dest_addr = dest_addr.wrapping_add(size_count as i64);
+                            flags &= !Flags::MOV_FLAGS;
+                            flags |= compute_flags_from_val(u64::from_le_bytes(val), ss);
+                            count = count.wrapping_sub(1);
+                            while count > 0 {
+                                self.write_bytes(dest_addr, &val[..size_count])?;
+                                dest_addr = dest_addr.wrapping_add(size_count as i64);
+                                flags &= !Flags::MOV_FLAGS;
+                                flags |= compute_flags_from_val(u64::from_le_bytes(val), ss);
+                                count = count.wrapping_sub(1);
+                            }
+                            Ok(())
+                        }
+                        _ => {
+                            let size_count = 1 << ss;
+                            self.write_bytes(dest_addr, &val[..size_count])?;
+                            dest_addr = dest_addr.wrapping_add(size_count as i64);
+                            flags &= !Flags::MOV_FLAGS;
+                            flags |= compute_flags_from_val(u64::from_le_bytes(val), ss);
+                            Ok(())
+                        }
+                    }
+                })();
+                // If an exception occurs after some operations, update the registers anyways
+                self.regs.flags = flags;
+                self.regs.gprs[1] = count;
+                self.regs.gprs[5] = dest_addr as u64;
+                res?;
+            }
+            CleverOpcode::Bsca { ss } => {
+                let mut val = [0u8; 8];
+                let mut src_addr = self.regs.gprs[4] as i64;
+                let mut count = self.regs.gprs[1];
+                let mut flags = self.regs.flags;
+                let res = (|| -> CPUResult<bool> {
+                    match insn.prefix() {
+                        Some(CleverOpcode::Repbi { cc }) => {
+                            let size_count = 1 << ss;
+                            if !self.test_cc(cc, flags) {
+                                return Ok(false);
+                            }
+                            self.read_bytes(src_addr, AccessKind::Access, &mut val[..size_count])?;
+                            src_addr = src_addr.wrapping_add(size_count as i64);
+                            flags &= !Flags::MOV_FLAGS;
+                            flags |= compute_flags_from_val(u64::from_le_bytes(val), ss);
+                            count = count.wrapping_sub(1);
+                            while count > 0 {
+                                if !self.test_cc(cc, flags) {
+                                    return Ok(true);
+                                }
+                                self.read_bytes(
+                                    src_addr,
+                                    AccessKind::Access,
+                                    &mut val[..size_count],
+                                )?;
+                                src_addr = src_addr.wrapping_add(size_count as i64);
+                                flags &= !Flags::MOV_FLAGS;
+                                flags |= compute_flags_from_val(u64::from_le_bytes(val), ss);
+                                count = count.wrapping_sub(1);
+                            }
+                            Ok(true)
+                        }
+                        Some(CleverOpcode::Repbc) => {
+                            let size_count = 1 << ss;
+                            self.read_bytes(src_addr, AccessKind::Access, &mut val[..size_count])?;
+                            src_addr = src_addr.wrapping_add(size_count as i64);
+                            flags &= !Flags::MOV_FLAGS;
+                            flags |= compute_flags_from_val(u64::from_le_bytes(val), ss);
+                            count = count.wrapping_sub(1);
+                            while count > 0 {
+                                self.read_bytes(
+                                    src_addr,
+                                    AccessKind::Access,
+                                    &mut val[..size_count],
+                                )?;
+                                src_addr = src_addr.wrapping_add(size_count as i64);
+                                flags &= !Flags::MOV_FLAGS;
+                                flags |= compute_flags_from_val(u64::from_le_bytes(val), ss);
+                                count = count.wrapping_sub(1);
+                            }
+                            Ok(true)
+                        }
+                        _ => {
+                            let size_count = 1 << ss;
+                            self.read_bytes(src_addr, AccessKind::Access, &mut val[..size_count])?;
+                            src_addr = src_addr.wrapping_add(size_count as i64);
+                            flags &= !Flags::MOV_FLAGS;
+                            flags |= compute_flags_from_val(u64::from_le_bytes(val), ss);
+                            Ok(true)
+                        }
+                    }
+                })();
+                // If an exception occurs after some operations, update the registers anyways
+                self.regs.flags = flags;
+                self.regs.gprs[1] = count;
+                self.regs.gprs[4] = src_addr as u64;
+                if res? {
+                    self.regs.gprs[0] = u64::from_le_bytes(val);
+                }
+            }
+            CleverOpcode::Bcmp { ss } => {
+                let mut dest_addr = self.regs.gprs[5] as i64;
+                let mut src_addr = self.regs.gprs[4] as i64;
+                let mut count = self.regs.gprs[1];
+                let mut flags = self.regs.flags;
+                let size_count = 1 << ss;
+                let mut val1 = [0u8; 8];
+                let mut val2 = [0u8; 8];
+                let res = (|| -> CPUResult<bool> {
+                    match insn.prefix() {
+                        Some(CleverOpcode::Repbi { cc }) => {
+                            if !self.test_cc(cc, flags) {
+                                return Ok(false);
+                            }
+                            self.read_bytes(
+                                dest_addr,
+                                AccessKind::Access,
+                                &mut val1[..size_count],
+                            )?;
+                            dest_addr = dest_addr.wrapping_add(size_count as i64);
+                            self.read_bytes(src_addr, AccessKind::Access, &mut val2[..size_count])?;
+                            src_addr = src_addr.wrapping_add(size_count as i64);
+                            let (_, res_flags) = do_arith_logic(
+                                u64::from_le_bytes(val1),
+                                u64::from_le_bytes(val2),
+                                ss,
+                                u64::overflowing_sub,
+                            );
+                            flags &= !Flags::ARITH_FLAGS;
+                            flags |= res_flags;
+                            count = count.wrapping_sub(1);
+                            while count > 0 {
+                                if !self.test_cc(cc, flags) {
+                                    return Ok(true);
+                                }
+                                self.read_bytes(
+                                    dest_addr,
+                                    AccessKind::Access,
+                                    &mut val1[..size_count],
+                                )?;
+                                dest_addr = dest_addr.wrapping_add(size_count as i64);
+                                self.read_bytes(
+                                    src_addr,
+                                    AccessKind::Access,
+                                    &mut val2[..size_count],
+                                )?;
+                                src_addr = src_addr.wrapping_add(size_count as i64);
+                                let (_, res_flags) = do_arith_logic(
+                                    u64::from_le_bytes(val1),
+                                    u64::from_le_bytes(val2),
+                                    ss,
+                                    u64::overflowing_sub,
+                                );
+                                flags &= !Flags::ARITH_FLAGS;
+                                flags |= res_flags;
+                                count = count.wrapping_sub(1);
+                            }
+                            Ok(true)
+                        }
+                        Some(CleverOpcode::Repbc) => {
+                            self.read_bytes(
+                                dest_addr,
+                                AccessKind::Access,
+                                &mut val1[..size_count],
+                            )?;
+                            dest_addr = dest_addr.wrapping_add(size_count as i64);
+                            self.read_bytes(src_addr, AccessKind::Access, &mut val2[..size_count])?;
+                            src_addr = src_addr.wrapping_add(size_count as i64);
+                            let (_, res_flags) = do_arith_logic(
+                                u64::from_le_bytes(val1),
+                                u64::from_le_bytes(val2),
+                                ss,
+                                u64::overflowing_sub,
+                            );
+                            flags &= !Flags::ARITH_FLAGS;
+                            flags |= res_flags;
+                            count = count.wrapping_sub(1);
+                            while count > 0 {
+                                self.read_bytes(
+                                    dest_addr,
+                                    AccessKind::Access,
+                                    &mut val1[..size_count],
+                                )?;
+                                dest_addr = dest_addr.wrapping_add(size_count as i64);
+                                self.read_bytes(
+                                    src_addr,
+                                    AccessKind::Access,
+                                    &mut val2[..size_count],
+                                )?;
+                                src_addr = src_addr.wrapping_add(size_count as i64);
+                                let (_, res_flags) = do_arith_logic(
+                                    u64::from_le_bytes(val1),
+                                    u64::from_le_bytes(val2),
+                                    ss,
+                                    u64::overflowing_sub,
+                                );
+                                flags &= !Flags::ARITH_FLAGS;
+                                flags |= res_flags;
+                                count = count.wrapping_sub(1);
+                            }
+                            Ok(true)
+                        }
+                        _ => {
+                            self.read_bytes(
+                                dest_addr,
+                                AccessKind::Access,
+                                &mut val1[..size_count],
+                            )?;
+                            dest_addr = dest_addr.wrapping_add(size_count as i64);
+                            self.read_bytes(src_addr, AccessKind::Access, &mut val2[..size_count])?;
+                            src_addr = src_addr.wrapping_add(size_count as i64);
+                            let (_, res_flags) = do_arith_logic(
+                                u64::from_le_bytes(val1),
+                                u64::from_le_bytes(val2),
+                                ss,
+                                u64::overflowing_sub,
+                            );
+                            flags &= !Flags::ARITH_FLAGS;
+                            flags |= res_flags;
+                            Ok(true)
+                        }
+                    }
+                })();
+                // If an exception occurs after some operations, update the registers anyways
+                self.regs.flags = flags;
+                self.regs.gprs[1] = count;
+                self.regs.gprs[5] = dest_addr as u64;
+                res?;
+            }
+            CleverOpcode::Btst { ss } => {
+                let test = self.regs.gprs[0];
+                let mut val = [0u8; 8];
+                let mut src_addr = self.regs.gprs[4] as i64;
+                let mut count = self.regs.gprs[1];
+                let mut flags = self.regs.flags;
+                let res = (|| -> CPUResult<bool> {
+                    match insn.prefix() {
+                        Some(CleverOpcode::Repbi { cc }) => {
+                            let size_count = 1 << ss;
+                            if !self.test_cc(cc, flags) {
+                                return Ok(false);
+                            }
+                            self.read_bytes(src_addr, AccessKind::Access, &mut val[..size_count])?;
+                            src_addr = src_addr.wrapping_add(size_count as i64);
+                            flags &= !Flags::MOV_FLAGS;
+                            flags |= compute_flags_from_val(u64::from_le_bytes(val) & test, ss);
+                            count = count.wrapping_sub(1);
+                            while count > 0 {
+                                if !self.test_cc(cc, flags) {
+                                    return Ok(true);
+                                }
+                                self.read_bytes(
+                                    src_addr,
+                                    AccessKind::Access,
+                                    &mut val[..size_count],
+                                )?;
+                                src_addr = src_addr.wrapping_add(size_count as i64);
+                                flags &= !Flags::MOV_FLAGS;
+                                flags |= compute_flags_from_val(u64::from_le_bytes(val) & test, ss);
+                                count = count.wrapping_sub(1);
+                            }
+                            Ok(true)
+                        }
+                        Some(CleverOpcode::Repbc) => {
+                            let size_count = 1 << ss;
+                            self.read_bytes(src_addr, AccessKind::Access, &mut val[..size_count])?;
+                            src_addr = src_addr.wrapping_add(size_count as i64);
+                            flags &= !Flags::MOV_FLAGS;
+                            flags |= compute_flags_from_val(u64::from_le_bytes(val) & test, ss);
+                            count = count.wrapping_sub(1);
+                            while count > 0 {
+                                self.read_bytes(
+                                    src_addr,
+                                    AccessKind::Access,
+                                    &mut val[..size_count],
+                                )?;
+                                src_addr = src_addr.wrapping_add(size_count as i64);
+                                flags &= !Flags::MOV_FLAGS;
+                                flags |= compute_flags_from_val(u64::from_le_bytes(val) & test, ss);
+                                count = count.wrapping_sub(1);
+                            }
+                            Ok(true)
+                        }
+                        _ => {
+                            let size_count = 1 << ss;
+                            self.read_bytes(src_addr, AccessKind::Access, &mut val[..size_count])?;
+                            src_addr = src_addr.wrapping_add(size_count as i64);
+                            flags &= !Flags::MOV_FLAGS;
+                            flags |= compute_flags_from_val(u64::from_le_bytes(val) & test, ss);
+                            Ok(true)
+                        }
+                    }
+                })();
+                // If an exception occurs after some operations, update the registers anyways
+                self.regs.flags = flags;
+                self.regs.gprs[1] = count;
+                self.regs.gprs[4] = src_addr as u64;
+                res?;
+            }
+            op if op.is_cbranch() => {
+                let addr = match &insn.operands()[0] {
+                    CleverOperand::Immediate(CleverImmediate::Long(_, val)) => *val as i64,
+                    CleverOperand::Immediate(CleverImmediate::LongRel(_, disp)) => {
+                        *disp + self.regs.ip
+                    }
+                    _ => unreachable!(),
+                };
+                if self.test_cc(op.branch_condition().unwrap(), self.regs.flags) {
+                    if (addr & 0x1) != 0 {
+                        return Err(CPUException::ExecutionAlignment(addr));
+                    }
+
+                    self.icache.borrow_mut().clear();
+                    self.regs.ip = addr;
+                }
+            }
+            CleverOpcode::JmpA { .. } | CleverOpcode::JmpR { .. } => {
+                let addr = match &insn.operands()[0] {
+                    CleverOperand::Immediate(CleverImmediate::Long(_, val)) => *val as i64,
+                    CleverOperand::Immediate(CleverImmediate::LongRel(_, disp)) => {
+                        *disp + self.regs.ip
+                    }
+                    _ => unreachable!(),
+                };
+                self.icache.borrow_mut().clear();
+                self.regs.ip = addr;
+            }
+            CleverOpcode::Halt => {
+                if self.regs.mode.contains(Mode::XM) {
+                    return Err(CPUException::SystemProtection(0));
+                }
+                self.status = Status::Halted;
+            }
+            CleverOpcode::Out { ss } => {
+                if self.regs.mode.contains(Mode::XM) {
+                    return Err(CPUException::SystemProtection(0));
+                }
+                let ioaddr = self.regs.gprs[2];
+                let mut port = self.ioports.get_port_for_addr(ioaddr);
+                let size_count = 1 << ss;
+                if let Some(prefix) = insn.prefix() {
+                    let mut src_addr = self.regs.gprs[4] as i64;
+                    let mut count = self.regs.gprs[1];
+                    let mut val = [0u8; 8];
+                    let flags = self.regs.flags;
+                    let res = (|| -> CPUResult<()> {
+                        match prefix {
+                            CleverOpcode::Repbi { cc } => {
+                                if !self.test_cc(cc, flags) {
+                                    return Ok(());
+                                }
+                                self.read_bytes(
+                                    src_addr,
+                                    AccessKind::Access,
+                                    &mut val[..size_count],
+                                )?;
+                                if let Some(port) = port.as_deref_mut() {
+                                    port.write(size_count as u64, u64::from_le_bytes(val));
+                                }
+                                src_addr = src_addr.wrapping_add(size_count as i64);
+                                count = count.wrapping_sub(1);
+                                while count > 0 {
+                                    self.read_bytes(
+                                        src_addr,
+                                        AccessKind::Access,
+                                        &mut val[..size_count],
+                                    )?;
+                                    if let Some(port) = port.as_deref_mut() {
+                                        port.write(size_count as u64, u64::from_le_bytes(val));
+                                    }
+                                    src_addr = src_addr.wrapping_add(size_count as i64);
+                                    count = count.wrapping_sub(1);
+                                }
+                                Ok(())
+                            }
+                            CleverOpcode::Repbc => {
+                                self.read_bytes(
+                                    src_addr,
+                                    AccessKind::Access,
+                                    &mut val[..size_count],
+                                )?;
+                                if let Some(port) = port.as_deref_mut() {
+                                    port.write(size_count as u64, u64::from_le_bytes(val));
+                                }
+                                src_addr = src_addr.wrapping_add(size_count as i64);
+                                count = count.wrapping_sub(1);
+                                while count > 0 {
+                                    self.read_bytes(
+                                        src_addr,
+                                        AccessKind::Access,
+                                        &mut val[..size_count],
+                                    )?;
+                                    if let Some(port) = port.as_deref_mut() {
+                                        port.write(size_count as u64, u64::from_le_bytes(val));
+                                    }
+                                    src_addr = src_addr.wrapping_add(size_count as i64);
+                                    count = count.wrapping_sub(1);
+                                }
+                                Ok(())
+                            }
+                            _ => Err(CPUException::Undefined),
+                        }
+                    })();
+                    self.regs.gprs[4] = src_addr as u64;
+                    self.regs.gprs[1] = count;
+                    res?;
+                } else {
+                    let val = self.regs.gprs[0];
+                    if let Some(port) = port.as_deref_mut() {
+                        port.write(size_count as u64, val);
+                    }
+                }
+            }
+            _ => return Err(CPUException::Undefined),
+        }
+
         Ok(())
+    }
+
+    pub fn status(&self) -> Status {
+        self.status
     }
 }
 
-pub struct Processor {
+pub struct Processor<'a> {
     mem: Arc<MemoryBus>,
     cpu: CPU,
+    io: IOBus,
+    init_mem: &'a [u8],
 }
 
 mod cpuinfo {
@@ -752,22 +2121,30 @@ mod cpuinfo {
     pub const CPUINFO: [u64; 8] = [CPUID0, CPUID1, CPUEX2, 0, 0, 0, 0, MSCPUEX];
 }
 
-impl Processor {
-    pub fn load_memory(init_mem: &[u8]) -> Processor {
+impl<'a> Processor<'a> {
+    pub fn load_memory(init_mem: &'a [u8], io: IOBus) -> Self {
         let mut bus = MemoryBus::new();
         bus.get_mut().write_bytes(init_mem, 0).unwrap();
 
         let mem = Arc::new(bus);
-        let mut cpu = CPU::new(mem.clone());
+        let mut cpu = CPU::new(mem.clone(), io.clone());
         cpu.get_regs_mut().ip = 0xff00;
-        cpu.get_regs_mut().flags = 0;
+        cpu.get_regs_mut().flags = Flags::empty();
+        cpu.get_regs_mut().mode = Mode::empty();
         cpu.get_regs_mut().cr[0] = 0;
         cpu.get_regs_mut().cpuinfo = cpuinfo::CPUINFO;
         cpu.get_regs_mut().fpcw = 4 | (1 << 4) | (0x1f << 16) | (1 << 24);
 
-        Self { cpu, mem }
+        Self {
+            cpu,
+            mem,
+            io,
+            init_mem,
+        }
     }
+}
 
+impl Processor<'_> {
     pub fn dump_state(&self, w: &mut core::fmt::Formatter) -> core::fmt::Result {
         w.write_str("CPU0:\n\n")?;
         w.write_str("Registers:\n")?;
@@ -784,5 +2161,42 @@ impl Processor {
         }
 
         Ok(())
+    }
+
+    pub fn cpu0(&self) -> &CPU {
+        &self.cpu
+    }
+
+    pub fn cpus(&self) -> &[CPU] {
+        core::slice::from_ref(&self.cpu)
+    }
+
+    pub fn step_processors<F: FnOnce(&Processor)>(&mut self, reset_cb: F) {
+        let res = match self.cpu.status() {
+            Status::Enabled => {
+                self.cpu.status = Status::Active;
+                Ok(())
+            }
+            Status::Active | Status::Interrupted => self.cpu.step(),
+            Status::Halted => self.cpu.poll_exceptions(),
+        };
+
+        match res {
+            Ok(()) => {}
+            Err(CPUException::Reset) => {
+                reset_cb(self);
+                self.mem.with_locked_bus(|f| {
+                    let _ = f.write_bytes(self.init_mem, 0);
+                });
+                self.cpu.get_regs_mut().ip = 0xff00;
+                self.cpu.get_regs_mut().flags = Flags::empty();
+                self.cpu.get_regs_mut().mode = Mode::empty();
+                self.cpu.get_regs_mut().cr[0] = 0;
+                self.cpu.get_regs_mut().cpuinfo = cpuinfo::CPUINFO;
+                self.cpu.get_regs_mut().fpcw = 4 | (1 << 4) | (0x1f << 16) | (1 << 24);
+                self.cpu.status = Status::Enabled;
+            }
+            Err(e) => self.cpu.pending_exceptions.push_back(e),
+        }
     }
 }
