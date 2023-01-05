@@ -1,0 +1,4 @@
+#!/bin/sh
+# Note MACHINE_DIR is relative to bios-template, so use .. to get back out
+make -C bios-template MACHINE_DIR=../machine-folder
+ln -sf bios-template/bios bios

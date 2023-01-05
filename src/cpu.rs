@@ -45,6 +45,7 @@ pub struct CPU {
     // L1 I-cache
     icache: RefCell<LruCache<i64, [u16; 16]>>,
     pcache_invalid: bool,
+    fetch_addr: i64,
 }
 
 #[inline]
@@ -151,6 +152,7 @@ impl CPU {
             icache: RefCell::new(LruCache::with_capacity(1024)),
             pcache_invalid: false,
             handling_exception: None,
+            fetch_addr: 0,
         }
     }
 
@@ -427,16 +429,16 @@ impl CPU {
     }
 
     pub fn fetch_iword(&mut self) -> CPUResult<u16> {
-        let icache_line = self.regs.ip & !0x1f;
-        let offset = ((self.regs.ip & 0x1f) >> 1) as usize;
-        self.regs.ip += 2;
+        let icache_line = self.fetch_addr & !0x1f;
+        let offset = ((self.fetch_addr & 0x1f) >> 1) as usize;
+        self.fetch_addr += 2;
         if let Some(line) = self.icache.get_mut().get(&icache_line) {
-            Ok(line[offset])
+            Ok(line[offset].to_be())
         } else {
             let line = self.read_aligned(icache_line, AccessKind::Execute)?;
             self.icache.get_mut().insert(icache_line, line);
 
-            Ok(line[offset])
+            Ok(line[offset].to_be())
         }
     }
 
@@ -454,6 +456,7 @@ impl CPU {
             return Ok(());
         }
         if let Some(mut except) = self.pending_exceptions.pop_front() {
+            eprintln!("Handling Exception {:?} current ip is {:#x}",except,self.regs.ip);
             match self.handling_exception {
                 Some(CPUException::Abort | CPUException::Reset) => except = CPUException::Reset,
                 Some(_) => except = CPUException::Abort,
@@ -499,7 +502,7 @@ impl CPU {
                     CPUException::Reset => Err(CPUException::Reset)?,
                 };
                 let extent = self.read_aligned::<u64>(itab_addr, AccessKind::Access)?;
-                if extent < ((index + 32) * 32) {
+                if extent < (index * 32 + 32) {
                     Err(CPUException::Abort)?
                 }
 
@@ -534,7 +537,6 @@ impl CPU {
             Ok(())
         }
     }
-
     fn check_extension(&self, ext: CleverExtension) -> CPUResult<()> {
         match ext {
             CleverExtension::Main => Ok(()),
@@ -570,7 +572,7 @@ impl CPU {
 
     fn fetch_insn(&mut self) -> CPUResult<CleverInstruction> {
         let iword = self.fetch_iword()?;
-        let opc = if let Some(insn) = CleverOpcode::from_opcode(iword.to_be()) {
+        let opc = if let Some(insn) = CleverOpcode::from_opcode(iword) {
             insn
         } else {
             return Err(CPUException::Undefined);
@@ -676,7 +678,7 @@ impl CPU {
             CleverOperandKind::Normal(n) => {
                 let mut ops = Vec::with_capacity(n as usize);
                 for _ in 0..n {
-                    let op = self.fetch_iword()?.to_be();
+                    let op = self.fetch_iword()?;
                     let op = match op >> 14 {
                         0b00 => {
                             let reg = CleverRegister((op & 0xff) as u8);
@@ -691,7 +693,7 @@ impl CPU {
                                 self.check_extension(CleverExtension::Vec)?;
                                 CleverOperand::VecPair { size, lo: reg }
                             } else {
-                                let size = 1 << ((op >> 8) & 0x3);
+                                let size = 8 << ((op >> 8) & 0x3);
                                 if (op & 0x1C00) != 0 {
                                     return Err(CPUException::Undefined);
                                 }
@@ -700,7 +702,7 @@ impl CPU {
                         }
                         0b01 => {
                             let base = CleverRegister((op & 0xf) as u8);
-                            let size = 1 << ((op >> 4) & 0x3);
+                            let size = 8 << ((op >> 4) & 0x3);
                             let scale = 1 << ((op >> 7) & 0x7);
 
                             let index = if op & 0x80 != 0 {
@@ -726,7 +728,7 @@ impl CPU {
                         }
                         0b11 => {
                             let ss = ((op >> 8) & 0x3) + 1;
-                            let size = 1 << ss;
+                            let size = 8 << ss;
                             if size == 128 {
                                 self.check_extension(CleverExtension::Vec)?;
                             }
@@ -749,7 +751,7 @@ impl CPU {
                             }
 
                             let mut val = 0u64;
-                            let iwords = size >> 1;
+                            let iwords = size >> 4;
                             for i in 0..iwords {
                                 let iword = self.fetch_iword()?;
                                 val |= (iword as u64) << (i * 16);
@@ -778,6 +780,9 @@ impl CPU {
                 }
                 Ok(CleverInstruction::new(opc, ops))
             }
+            CleverOperandKind::Size |
+            CleverOperandKind::HRegister |
+            CleverOperandKind::HImmediate => Ok(CleverInstruction::new(opc,vec![])),
         }
     }
 
@@ -1138,6 +1143,7 @@ impl CPU {
 
     pub fn step(&mut self) -> CPUResult<()> {
         self.poll_exceptions()?;
+        self.fetch_addr = self.regs.ip;
         let insn = self.fetch_insn()?;
 
         if let Some(CleverOpcode::Vec { .. }) = insn.prefix() {
@@ -1145,6 +1151,7 @@ impl CPU {
         }
 
         match insn.opcode() {
+            CleverOpcode::Und0 | CleverOpcode::Und255 => Err(CPUException::Undefined)?,
             CleverOpcode::Add { lock, flags } => {
                 self.check_only_one_memory(insn.operands())?;
                 let [dest, src] = match insn.operands() {
@@ -1963,7 +1970,6 @@ impl CPU {
                         return Err(CPUException::ExecutionAlignment(addr));
                     }
 
-                    self.icache.borrow_mut().clear();
                     self.regs.ip = addr;
                 }
             }
@@ -1975,7 +1981,18 @@ impl CPU {
                     }
                     _ => unreachable!(),
                 };
-                self.icache.borrow_mut().clear();
+                self.regs.ip = addr;
+            }
+            CleverOpcode::CallA{ .. } | CleverOpcode::CallR{ .. } => {
+                let addr = match &insn.operands()[0] {
+                    CleverOperand::Immediate(CleverImmediate::Long(_, val)) => *val as i64,
+                    CleverOperand::Immediate(CleverImmediate::LongRel(_, disp)) => {
+                        *disp + self.regs.ip
+                    }
+                    _ => unreachable!(),
+                };
+                let lastip = self.fetch_addr;
+                self.push(lastip)?;
                 self.regs.ip = addr;
             }
             CleverOpcode::Halt => {
@@ -2064,9 +2081,29 @@ impl CPU {
                     }
                 }
             }
-            _ => return Err(CPUException::Undefined),
-        }
+            CleverOpcode::Cmp => {
+                let [op1,op2] = match insn.operands(){
+                    [op1,op2] => [op1,op2],
+                    _ => unreachable!()
+                };
 
+                self.check_read(op1)?;
+                self.check_read(op2)?;
+                self.check_only_one_memory(insn.operands())?;
+
+                let ss = op1.size_ss().unwrap_or(1).max(op2.size_ss().unwrap_or(1));
+
+                let a = self.read_u64_by_size(op1)?;
+                let b = self.read_u64_by_size(op2)?;
+
+                let (_, flags) = do_arith_logic(a, b, ss, u64::overflowing_sub);
+
+                self.regs.flags = (self.regs.flags&!Flags::ARITH_FLAGS) | flags;
+
+            }
+            op => panic!("Unhandled defined opcode {:?}",op),
+        }
+        self.regs.ip = self.fetch_addr;
         Ok(())
     }
 
@@ -2145,6 +2182,14 @@ impl<'a> Processor<'a> {
 }
 
 impl Processor<'_> {
+
+    pub fn get_memory(&self) -> &Arc<MemoryBus>{
+        &self.mem
+    }
+
+    pub fn get_iobus_mut(&mut self) -> &mut IOBus{
+        &mut self.io
+    }
     pub fn dump_state(&self, w: &mut core::fmt::Formatter) -> core::fmt::Result {
         w.write_str("CPU0:\n\n")?;
         w.write_str("Registers:\n")?;
@@ -2196,7 +2241,7 @@ impl Processor<'_> {
                 self.cpu.get_regs_mut().fpcw = 4 | (1 << 4) | (0x1f << 16) | (1 << 24);
                 self.cpu.status = Status::Enabled;
             }
-            Err(e) => self.cpu.pending_exceptions.push_back(e),
+            Err(e) => {eprintln!("got exception {:?}",e); self.cpu.pending_exceptions.push_back(e)},
         }
     }
 }

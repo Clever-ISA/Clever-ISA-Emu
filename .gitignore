@@ -3,3 +3,7 @@
 
 build*/
 autom4te.cache/
+machine-folder/*.o
+bootloader/*.o
+boot.img
+boot/
