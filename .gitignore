@@ -7,3 +7,4 @@ machine-folder/*.o
 bootloader/*.o
 boot.img
 boot/
+bootloader/stage2/target/
