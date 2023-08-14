@@ -1,13 +1,15 @@
 use std::{
     fs::File,
-    io::{stdout, Read, Write, Seek, SeekFrom},
-    time::Duration, sync::Arc,
+    io::{stdout, Read, Seek, SeekFrom, Write},
+    sync::Arc,
+    time::Duration,
 };
 
 use bytemuck::{Pod, Zeroable};
 use clever_isa_emu::{
     cpu::{Processor, Status},
-    io::{IOBus, IOPort}, mem::MemoryBus,
+    io::{IOBus, IOPort},
+    mem::MemoryBus,
 };
 
 pub struct DumpRegState<'a, 'b>(&'a Processor<'b>);
@@ -34,34 +36,33 @@ impl IOPort for StdoutPort {
     }
 }
 
-
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, Pod, Zeroable)]
-pub struct DmaReq{
+pub struct DmaReq {
     pub paddr: u64,
     pub len: u64,
     pub diskoff: u64,
     pub flags: u64,
 }
 
-pub struct FastDmaStructure<W>{
+pub struct FastDmaStructure<W> {
     backing: W,
     membus: Arc<MemoryBus>,
 }
 
-impl<W> FastDmaStructure<W>{
-    pub const fn new(backing: W, membus: Arc<MemoryBus>) -> Self{
-        Self{backing,membus}
+impl<W> FastDmaStructure<W> {
+    pub const fn new(backing: W, membus: Arc<MemoryBus>) -> Self {
+        Self { backing, membus }
     }
 
-    pub fn into_inner(self) -> W{
+    pub fn into_inner(self) -> W {
         self.backing
     }
 }
 
-impl<W: Read+Seek> IOPort for FastDmaStructure<W>{
+impl<W: Read + Seek> IOPort for FastDmaStructure<W> {
     fn matches_addr(&self, addr: u64) -> bool {
-        addr==0x100000001
+        addr == 0x100000001
     }
 
     fn read(&mut self, size: u64) -> u64 {
@@ -71,31 +72,31 @@ impl<W: Read+Seek> IOPort for FastDmaStructure<W>{
     fn write(&mut self, size: u64, val: u64) {
         let addr = val;
 
-        let _ = (||{
-            let mut req: DmaReq = self.membus.with_unlocked_bus(|bus|bus.read(addr)).ok()?;
+        let _ = (|| {
+            let mut req: DmaReq = self.membus.with_unlocked_bus(|bus| bus.read(addr)).ok()?;
 
-            if req.flags&1!=0{
+            if req.flags & 1 != 0 {
                 None?
             }
 
             self.backing.seek(SeekFrom::Start(req.diskoff)).ok()?;
-            
-            while req.len >= 1024{
-                let mut buf = [0u8;1024];
+
+            while req.len >= 1024 {
+                let mut buf = [0u8; 1024];
                 self.backing.read(&mut buf).ok()?;
-                self.membus.with_locked_bus(|bus|{
-                    bus.write_bytes(&buf, req.paddr)
-                }).ok()?;
+                self.membus
+                    .with_locked_bus(|bus| bus.write_bytes(&buf, req.paddr))
+                    .ok()?;
 
                 req.paddr += 1024;
-                req.len -=1024;
+                req.len -= 1024;
             }
 
-            let mut buf = [0u8;1024];
+            let mut buf = [0u8; 1024];
             self.backing.read(&mut buf[..(req.len as usize)]).ok()?;
-            self.membus.with_locked_bus(|bus|{
-                bus.write_bytes(&buf[..(req.len as usize)], req.paddr)
-            }).ok()?;
+            self.membus
+                .with_locked_bus(|bus| bus.write_bytes(&buf[..(req.len as usize)], req.paddr))
+                .ok()?;
 
             Some(())
         })();
@@ -109,14 +110,13 @@ fn main() {
     let mut file = File::open("bios").unwrap();
     file.read_to_end(&mut mem).unwrap();
     let mut proc = Processor::load_memory(&mem, bus);
-    
-    
 
-    if let Ok(file) = File::open("boot.img"){
+    if let Ok(file) = File::open("boot.img") {
         let bus = proc.get_memory().clone();
-        proc.get_iobus_mut().register(FastDmaStructure::new(file, bus));
+        proc.get_iobus_mut()
+            .register(FastDmaStructure::new(file, bus));
     }
-    
+
     while proc.cpu0().status() != Status::Halted {
         proc.step_processors(|proc| {
             println!("RESET Encountered. Processor State Before RESET:");

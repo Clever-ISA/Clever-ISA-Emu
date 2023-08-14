@@ -12,7 +12,8 @@ float = [] # X-float
 vector = [] # X-vector
 float-ext = ["float"] # X-float-ext
 rand = ["dep:rand"] # X-rand
-
+aci = []
+wpgu = ["dep:wgpu", "dep:winit", "aci"]
 'clever1.0' = ["float", "vector", "float-ext"]
 
 [dependencies]
@@ -25,3 +26,5 @@ lru_time_cache = "0.11.11"
 bitflags = "1.2.1"
 num-traits = "0.2.14"
 arch-ops = {path="lc-binutils/arch-ops",features=["clever"]}
+wgpu = {version="0.17.0", optional=true}
+winit = {version="0.28.3", optional=true}

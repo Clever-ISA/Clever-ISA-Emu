@@ -13,6 +13,14 @@ pub trait IOPort {
     fn write(&mut self, size: u64, val: u64) {}
 }
 
+pub trait IoMmuDevice {
+    fn matches_addr(&self, addr: u64) -> bool;
+
+    fn read(&mut self, bytes: &mut [u8]);
+
+    fn write(&mut self, bytes: &[u8]);
+}
+
 #[derive(Clone)]
 pub struct IOBus {
     devices: Vec<Arc<RwLock<dyn IOPort>>>,
