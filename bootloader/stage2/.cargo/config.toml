@@ -1,6 +1,10 @@
 
 [build]
-target = "x86_64-unknown-none"
+target = "clever-unknown-elf"
+
+[env]
+RUST_TARGET_PATH = {value ="targets", relative=true}
+
 
 [unstable]
 build-std = ["core", "alloc", "compiler_builtins"]

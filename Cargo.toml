@@ -11,20 +11,21 @@ float = [] # X-float
 # decimal-fp = ["fp","decimal"]
 vector = [] # X-vector
 float-ext = ["float"] # X-float-ext
-rand = ["dep:rand"] # X-rand
+rand = [] # X-rand
 aci = []
 wpgu = ["dep:wgpu", "dep:winit", "aci"]
 'clever1.0' = ["float", "vector", "float-ext"]
+hash-accel = []
 
 [dependencies]
 parking_lot = "0.11.1"
 bytemuck = {version="1.7.0",features=["derive","min_const_generics"]}
-half = {version="1.7.1",features=["bytemuck"]}
-rand = {version="0.8.5", optional = true}
+rand = {version="0.8.5"}
 fake-enum = "0.1.2"
 lru_time_cache = "0.11.11"
-bitflags = "1.2.1"
+paste = "1.0.14"
 num-traits = "0.2.14"
-arch-ops = {path="lc-binutils/arch-ops",features=["clever"]}
 wgpu = {version="0.17.0", optional=true}
 winit = {version="0.28.3", optional=true}
+lccc-siphash = "0.1"
+sptr = "0.3.2"

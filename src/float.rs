@@ -1,183 +1,106 @@
-use std::num::FpCategory;
+use bytemuck::{Pod, Zeroable};
 
-use half::f16;
+use crate::bitfield;
+use crate::primitive::*;
 
-#[derive(Clone, Debug, Copy)]
-pub struct CleverFloat(u64, u16);
-
-#[repr(u8)]
-pub enum RoundingMode {
-    Upwards = 0,
-    Downwards = 1,
-    Truncate = 2,
-    HalfUp = 3,
-    HalfToEven = 4,
-}
-
-const FORMATS: [(u32, u32, i64, u64); 4] = [
-    (0, 0, 0, 0),
-    (10, 5, 15, 0x1f),
-    (23, 8, 127, 0xff),
-    (52, 11, 1023, 0x7ff),
-];
-
-bitflags::bitflags! {
-    #[repr(transparent)]
-    pub struct FpException : u16 {
-        const INVALID = 0x01;
-        const DIVBYZERO = 0x02;
-        const OVERFLOW  = 0x04;
-        const UNDERFLOW = 0x08;
-        const INEXACT   = 0x10;
-        const SIGNAL    = 0x20;
+bitfield! {
+    pub struct FpException: LeU8{
+        pub invalid @ 0: bool,
+        pub div_by_zero @ 1: bool,
+        pub overflow @ 2: bool,
+        pub underflow @ 3: bool,
+        pub inexact @ 4: bool,
+        pub signal @ 5: bool,
     }
 }
 
-pub type FloatResult<T> = Result<T, (FpException, T)>;
+le_fake_enum! {
+    #[repr(LeU8)]
+    #[derive(Pod, Zeroable)]
+    pub enum RoundingMode{
+        HalfToEven = 0,
+        ToInf = 1,
+        ToNInf = 2,
+        ToZero = 3,
+    }
+}
 
-impl CleverFloat {
-    pub const fn with_size(ss: u16) -> Self {
-        Self::from_bits_with_size(0, ss)
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct CleverFloat<T>(T);
+
+pub unsafe trait FloatRepr: Pod {
+    const MANT_BITS: u32;
+    const EXP_BITS: u32;
+    const EXP_BIAS: Self;
+}
+
+unsafe impl<T: Zeroable> Zeroable for CleverFloat<T> {}
+unsafe impl<T: Pod> Pod for CleverFloat<T> {}
+
+unsafe impl FloatRepr for LeI16 {
+    const MANT_BITS: u32 = 10;
+    const EXP_BITS: u32 = 5;
+    const EXP_BIAS: Self = Self::new(15);
+}
+
+unsafe impl FloatRepr for LeI32 {
+    const MANT_BITS: u32 = 23;
+    const EXP_BITS: u32 = 8;
+    const EXP_BIAS: Self = Self::new(127);
+}
+
+unsafe impl FloatRepr for LeI64 {
+    const MANT_BITS: u32 = 52;
+    const EXP_BITS: u32 = 11;
+    const EXP_BIAS: Self = Self::new(1023);
+}
+
+unsafe impl FloatRepr for LeI128 {
+    const MANT_BITS: u32 = 113;
+    const EXP_BITS: u32 = 15;
+    const EXP_BIAS: Self = Self::new(16383);
+}
+
+impl<T> CleverFloat<T> {
+    pub const fn from_bits(x: T) -> Self {
+        Self(x)
     }
 
-    pub const fn from_bits_with_size(bits: u64, ss: u16) -> Self {
-        [(); 1][(!(0 < ss && ss < 3)) as usize]; // No I'm not sorry for this const_panic hack
+    pub fn into_bits(self) -> T {
+        self.0
+    }
+}
 
-        Self(
-            bits & (2u64
-                .wrapping_shl(8u32.wrapping_shl(ss as u32) - 1)
-                .wrapping_sub(1)),
-            ss,
-        )
+impl<T: FloatRepr> CleverFloat<T> {}
+
+pub type CleverF16 = CleverFloat<LeI16>;
+pub type CleverF32 = CleverFloat<LeI32>;
+pub type CleverF64 = CleverFloat<LeI64>;
+pub type CleverF128 = CleverFloat<LeI128>;
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, Zeroable, Pod)]
+pub struct CleverFloatReg(LeI64);
+
+impl CleverFloatReg {
+    pub const fn from_bits(x: LeI64) -> Self {
+        Self(x)
     }
 
-    pub const POSITIVE_INFINITY: Self = Self::positive_infinity(3);
-    pub const NEGATIVE_INFINITY: Self = Self::negative_infinity(3);
-    pub const NAN: Self = Self::nan(3);
-
-    pub const fn positive_infinity(ss: u16) -> Self {
-        [(); 1][(ss == 0) as usize];
-
-        Self(FORMATS[ss as usize].3 << FORMATS[ss as usize].0, ss)
+    pub const fn into_bits(self) -> LeI64 {
+        self.0
     }
 
-    pub const fn negative_infinity(ss: u16) -> Self {
-        [(); 1][(ss == 0) as usize];
-        Self(
-            (FORMATS[ss as usize].3 << FORMATS[ss as usize].0)
-                | 1u64 << (FORMATS[ss as usize].0 + FORMATS[ss as usize].1),
-            ss,
-        )
+    pub const fn into_f64(self) -> CleverF64 {
+        CleverF64::from_bits(self.0)
     }
 
-    pub const fn nan(ss: u16) -> Self {
-        [(); 1][(ss == 0) as usize];
-
-        Self(
-            (1u64 << (FORMATS[ss as usize].0 - 1))
-                | (FORMATS[ss as usize].3 << FORMATS[ss as usize].0),
-            ss,
-        )
+    pub const fn into_f32(self) -> CleverF32 {
+        CleverF32::from_bits(self.0.truncate_to())
     }
 
-    pub const fn negative(self) -> bool {
-        self.0 & (1u64.wrapping_shl(8u32.wrapping_shl(self.1 as u32) - 1)) != 0
-    }
-
-    pub const fn exponent(self) -> i64 {
-        ((self.0 >> (FORMATS[self.1 as usize].0)) & ((1u64 << FORMATS[self.1 as usize].1) - 1))
-            as i64
-            - FORMATS[self.1 as usize].2
-    }
-
-    pub const fn classify(self) -> FpCategory {
-        let exp =
-            (self.0 >> (FORMATS[self.1 as usize].0)) & ((1u64 << FORMATS[self.1 as usize].1) - 1);
-        let sig = (self.0) & (1u64 << (FORMATS[self.1 as usize].0));
-        if exp == 0 && sig != 0 {
-            return FpCategory::Subnormal;
-        } else if exp == 0 {
-            return FpCategory::Zero;
-        } else if exp == FORMATS[self.1 as usize].3 && sig != 0 {
-            return FpCategory::Nan;
-        } else if exp == FORMATS[self.1 as usize].3 {
-            return FpCategory::Infinite;
-        } else {
-            return FpCategory::Normal;
-        }
-    }
-
-    pub const fn resize(self, ss: u16) -> FloatResult<Self> {
-        [(); 1][(ss == 0) as usize]; // more const_panic hacks
-                                     // Will t-compiler/const-eval finish bikeshedding soon enough to save panic errors?
-                                     // Well...
-        let sig = self.0 & (1u64 << FORMATS[self.1 as usize].0).wrapping_sub(1);
-        Ok(match self.classify() {
-            FpCategory::Nan => Self(
-                ((self.negative() as u64) << (1u64.wrapping_shl(8u32.wrapping_shl(ss as u32) - 1)))
-                    | (1u64 << (FORMATS[self.1 as usize].0 - 1))
-                    | (FORMATS[ss as usize].3 << FORMATS[ss as usize].0),
-                ss,
-            ),
-            FpCategory::Infinite => Self(
-                ((self.negative() as u64) << (1u64.wrapping_shl(8u32.wrapping_shl(ss as u32) - 1)))
-                    | (FORMATS[ss as usize].3 << FORMATS[ss as usize].0),
-                ss,
-            ),
-            FpCategory::Zero => Self(
-                ((self.negative() as u64) << (1u64.wrapping_shl(8u32.wrapping_shl(ss as u32) - 1))),
-                ss,
-            ),
-            FpCategory::Subnormal => {
-                let diffsig = (FORMATS[ss as usize].0 as i32) - (FORMATS[self.1 as usize].0 as i32);
-                let sig = sig;
-                let rsig = if diffsig < 0 {
-                    sig >> (-diffsig)
-                } else {
-                    sig << diffsig
-                };
-
-                let val = ((self.negative() as u64)
-                    << (1u64.wrapping_shl(8u32.wrapping_shl(ss as u32) - 1)))
-                    | rsig; // drop the implicit bit here
-                if diffsig < 0 && rsig << (-diffsig) != sig {
-                    return Err((FpException::INEXACT, CleverFloat(val, ss)));
-                }
-                CleverFloat(val, ss)
-            }
-            FpCategory::Normal => {
-                let diffsig = (FORMATS[ss as usize].0 as i32) - (FORMATS[self.1 as usize].0 as i32);
-                let rsig = if diffsig < 0 {
-                    sig >> (-diffsig)
-                } else {
-                    sig << diffsig
-                };
-                let exp = self.exponent();
-                if exp > FORMATS[ss as usize].2 {
-                    return Err((
-                        FpException::OVERFLOW,
-                        Self(
-                            (FORMATS[ss as usize].3 << FORMATS[ss as usize].0)
-                                | ((self.negative() as u64)
-                                    << (1u64.wrapping_shl(8u32.wrapping_shl(ss as u32) - 1))),
-                            ss,
-                        ),
-                    ));
-                } else if exp < -FORMATS[ss as usize].2 {
-                    return Err((FpException::UNDERFLOW, Self(0, ss))); // TODO, we can underflow to DENORMALs as well
-                } else {
-                    let raw_exp = ((exp + FORMATS[ss as usize].2) as u64) << FORMATS[ss as usize].0;
-                    let val = ((self.negative() as u64)
-                        << (1u64.wrapping_shl(8u32.wrapping_shl(ss as u32) - 1)))
-                        | rsig;
-
-                    if diffsig < 0 && rsig << (-diffsig) != sig {
-                        return Err((FpException::INEXACT, CleverFloat(val, ss)));
-                    } else {
-                        Self(val, ss)
-                    }
-                }
-            }
-        })
+    pub const fn into_f16(self) -> CleverF16 {
+        CleverF16::from_bits(self.0.truncate_to())
     }
 }

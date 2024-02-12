@@ -4,3 +4,6 @@
 [submodule "bios-template"]
 	path = bios-template
 	url = https://github.com/Clever-ISA/bios-template.git
+[submodule "href-microcode"]
+	path = href-microcode
+	url = https://github.com/Clever-ISA/href-microcode

@@ -1,195 +1,184 @@
-use bytemuck::{Pod, Zeroable};
+use crate::cpu::CpuExecutionMode;
+use crate::cpu::ExecutionMode;
+use crate::error::AccessKind;
+use crate::error::CPUException;
+use crate::error::CPUResult;
+use crate::error::FaultCharacteristics;
+use crate::error::FaultStatus;
+use crate::primitive::*;
 
-use crate::{
-    cpu::CpuExecutionMode,
-    error::{AccessKind, CPUException, CPUResult, FaultCharacteristics, FaultStatus},
-};
+use crate::bitfield;
 
-#[derive(Copy, Clone, Zeroable, Pod)]
-#[repr(transparent)]
-pub struct PageEntry(pub u64);
-
-#[repr(u64)]
-#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
-pub enum LowerPagePermission {
-    Empty = 0,
-    Read = 1,
-    Write = 2,
-    Exec = 3,
+le_fake_enum! {
+    #[repr(LeU8)]
+    #[derive(bytemuck::Pod, bytemuck::Zeroable)]
+    pub enum LpePerm{
+        Empty = 0,
+        Read = 1,
+        Write = 2,
+        Exec = 3
+    }
 }
 
-unsafe impl Zeroable for LowerPagePermission {}
-
-#[repr(u64)]
-#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
-pub enum NestedPagePermission {
-    Empty = 0,
-    Present = 1,
+le_fake_enum! {
+    #[repr(LeU8)]
+    #[derive(bytemuck::Pod, bytemuck::Zeroable)]
+    pub enum NpePerm{
+        Empty = 0,
+        Present = 1,
+    }
 }
 
-unsafe impl Zeroable for NestedPagePermission {}
+bitfield! {
+    pub struct LpeBits: LeU16{
+        pub perm @ 0..2: LpePerm,
+        pub xm @ 2..4: ExecutionMode,
+        pub sxp @ 4: bool,
+        pub supervisor @ 10..12: LeU16,
+    }
+}
 
-bitflags::bitflags! {
-    pub struct PageFlags: u64{
-        const XM  = 0b000100;
-        const XMM = 0b001000;
-        const SXP = 0b010000;
-        const OSSU0 = 0b01000000000;
-        const OSSU1 = 0b010000000000;
-        const OSSU2 = 0b0100000000000;
-        const OSSU3 = 0b1000000000000;
+impl LpeBits {
+    pub fn check_valid(&self, vaddr: LeI64, mut rest_fault: FaultCharacteristics) -> CPUResult<()> {
+        rest_fault.status |= FaultStatus::with_validation_error(true);
+        if self.validate() {
+            Err(CPUException::PageFault(vaddr, rest_fault))
+        } else {
+            match self.xm().check_valid() {
+                Ok(()) => Ok(()),
+                Err(_) => Err(CPUException::PageFault(vaddr, rest_fault)),
+            }
+        }
+    }
+}
+
+bitfield! {
+    pub struct NpeBits: LeU16{
+        pub perm @ 0..1: NpePerm,
+        pub xm @ 2..4: ExecutionMode,
+        pub sxp @ 4: bool,
+        pub supervisor @ 10..12: LeU16,
+    }
+}
+
+impl NpeBits {
+    pub fn check_valid(&self, vaddr: LeI64, mut rest_fault: FaultCharacteristics) -> CPUResult<()> {
+        rest_fault.status |= FaultStatus::with_validation_error(true);
+        if self.validate() {
+            Err(CPUException::PageFault(vaddr, rest_fault))
+        } else {
+            match self.xm().check_valid() {
+                Ok(()) => Ok(()),
+                Err(_) => Err(CPUException::PageFault(vaddr, rest_fault)),
+            }
+        }
+    }
+}
+
+bitfield! {
+    pub struct SharedBits: LeU16{
+        pub perm @ 0..2: LeU8,
+        pub xm @ 2..4: ExecutionMode,
+        pub sxp @ 4: bool,
+        pub supervisor @ 10..12: LeU16,
+    }
+}
+
+bitfield! {
+    pub struct PageEntry : LeU64{
+        pub flags @ 0..12: SharedBits,
+        pub addr @ 12..64: LeU64
+    }
+}
+
+bitfield! {
+    pub struct PgTab : LeU64{
+        pub ptl @ 0..3 : LeU8,
+        pub addr @ 12..64 : LeU64,
+    }
+}
+
+impl PgTab {
+    pub fn page_addr(self) -> LeU64 {
+        self.addr() << 12
+    }
+
+    pub fn check_valid(self) -> CPUResult<()> {
+        if !self.validate() {
+            Err(CPUException::Undefined)
+        } else if self.ptl() > 4 {
+            Err(CPUException::Undefined)
+        } else {
+            Ok(())
+        }
     }
 }
 
 impl PageEntry {
-    pub fn lower_page_permission(&self) -> LowerPagePermission {
-        // SAFETY:
-        // All discriminants from 0 to 3 are populated
-        unsafe { core::mem::transmute(self.0 & 0x3) }
+    pub fn lpe_flags(self) -> LpeBits {
+        LpeBits::from_bits(self.flags().bits())
     }
 
-    pub fn nested_page_permission(&self) -> Option<NestedPagePermission> {
-        match self.0 & 0x3 {
-            2 | 3 => None,
-            x => Some(unsafe { core::mem::transmute(x) }),
-        }
+    pub fn npe_flags(self) -> NpeBits {
+        NpeBits::from_bits(self.flags().bits())
     }
 
-    pub fn flags(&self) -> PageFlags {
-        PageFlags::from_bits_truncate(self.0 & 0xffc)
+    pub fn page_addr(self) -> LeU64 {
+        self.addr() << 12
     }
 
-    pub fn value(&self) -> u64 {
-        self.0 & !0xfff
-    }
-
-    pub fn check_access(
-        &self,
-        access: AccessKind,
-        level: u8,
-        vaddr: i64,
+    pub fn try_access(
+        self,
+        level: LeU8,
         mode: CpuExecutionMode,
+        access: AccessKind,
+        mut rest_fault_info: FaultCharacteristics,
+        vaddr: LeI64,
     ) -> CPUResult<()> {
-        let base_status = match mode {
-            CpuExecutionMode::Supervisor => FaultStatus::empty(),
-            CpuExecutionMode::User => FaultStatus::STATUS_USER,
-        } | if level > 0 {
-            FaultStatus::STATUS_NESTED
-        } else {
-            FaultStatus::empty()
-        };
-        let flags = self.flags();
+        rest_fault_info.status |= FaultStatus::with_mode(ExecutionMode::from_mode(mode));
 
-        if flags.bits() != self.0 & 0xffc {
-            return Err(CPUException::PageFault(
-                vaddr,
-                FaultCharacteristics {
-                    pref: self.0,
-                    access_kind: access,
-                    flevel: level,
-                    status: base_status | FaultStatus::STATUS_VALIDATION_ERROR,
-                    ..Zeroable::zeroed()
-                },
-            ));
+        rest_fault_info.access_kind = access;
+        rest_fault_info.pref = self.page_addr();
+        rest_fault_info.flevel = level;
+
+        if !self.flags().validate() {
+            return Err(CPUException::PageFault(vaddr, rest_fault_info));
         }
 
-        if flags.contains(PageFlags::XM) ^ flags.contains(PageFlags::XMM) {
-            return Err(CPUException::PageFault(
-                vaddr,
-                FaultCharacteristics {
-                    pref: self.0,
-                    access_kind: access,
-                    flevel: level,
-                    status: base_status | FaultStatus::STATUS_VALIDATION_ERROR,
-                    ..Zeroable::zeroed()
-                },
-            ));
+        if mode > self.flags().xm().mode() {
+            return Err(CPUException::PageFault(vaddr, rest_fault_info));
         }
 
-        if flags.contains(PageFlags::SXP)
-            && access == AccessKind::Execute
-            && mode == CpuExecutionMode::Supervisor
-        {
-            return Err(CPUException::PageFault(
-                vaddr,
-                FaultCharacteristics {
-                    pref: self.0,
-                    access_kind: access,
-                    flevel: level,
-                    status: base_status | FaultStatus::STATUS_PREVENTED,
-                    ..Zeroable::zeroed()
-                },
-            ));
-        }
+        if level == 0 {
+            self.lpe_flags().check_valid(vaddr, rest_fault_info)?;
 
-        if !flags.contains(PageFlags::XM) && mode == CpuExecutionMode::User {
-            return Err(CPUException::PageFault(
-                vaddr,
-                FaultCharacteristics {
-                    pref: self.0,
-                    access_kind: access,
-                    flevel: level,
-                    status: base_status,
-                    ..Zeroable::zeroed()
-                },
-            ));
-        }
-
-        if level > 0 {
-            match self.nested_page_permission().ok_or_else(|| {
-                CPUException::PageFault(
-                    vaddr,
-                    FaultCharacteristics {
-                        pref: self.0,
-                        access_kind: access,
-                        flevel: level,
-                        status: base_status | FaultStatus::STATUS_VALIDATION_ERROR,
-                        ..Zeroable::zeroed()
-                    },
-                )
-            })? {
-                NestedPagePermission::Empty => Err(CPUException::PageFault(
-                    vaddr,
-                    FaultCharacteristics {
-                        pref: self.0,
-                        access_kind: access,
-                        flevel: level,
-                        status: base_status,
-                        ..Zeroable::zeroed()
-                    },
-                )),
-                NestedPagePermission::Present => Ok(()),
+            match (access, self.lpe_flags().perm()) {
+                (_, LpePerm::Empty) => Err(CPUException::PageFault(vaddr, rest_fault_info)),
+                (AccessKind::Access, _) | (AccessKind::Write, LpePerm::Write) => Ok(()),
+                (AccessKind::Execute, LpePerm::Exec) => {
+                    if self.lpe_flags().sxp() && mode == CpuExecutionMode::Supervisor {
+                        rest_fault_info.status |= FaultStatus::with_prevented(true);
+                        Err(CPUException::PageFault(vaddr, rest_fault_info))
+                    } else {
+                        Ok(())
+                    }
+                }
+                _ => Err(CPUException::PageFault(vaddr, rest_fault_info)),
             }
         } else {
-            match (self.lower_page_permission(), access) {
-                (LowerPagePermission::Empty, _) => Err(CPUException::PageFault(
-                    vaddr,
-                    FaultCharacteristics {
-                        pref: self.0,
-                        access_kind: access,
-                        flevel: level,
-                        status: base_status,
-                        ..Zeroable::zeroed()
-                    },
-                )),
-                (_, AccessKind::Access) => Ok(()),
-                (LowerPagePermission::Write, AccessKind::Write) => Ok(()),
-                (LowerPagePermission::Exec, AccessKind::Execute) => Ok(()),
-                _ => Err(CPUException::PageFault(
-                    vaddr,
-                    FaultCharacteristics {
-                        pref: self.0,
-                        access_kind: access,
-                        flevel: level,
-                        status: base_status,
-                        ..Zeroable::zeroed()
-                    },
-                )),
+            self.npe_flags().check_valid(vaddr, rest_fault_info)?;
+
+            if self.npe_flags().perm() == NpePerm::Empty {
+                Err(CPUException::PageFault(vaddr, rest_fault_info))
+            } else if access == AccessKind::Execute
+                && self.lpe_flags().sxp()
+                && mode == CpuExecutionMode::Supervisor
+            {
+                rest_fault_info.status |= FaultStatus::with_prevented(true);
+                Err(CPUException::PageFault(vaddr, rest_fault_info))
+            } else {
+                Ok(())
             }
         }
     }
 }
-
-#[derive(Copy, Clone)]
-#[repr(C, align(4096))]
-pub struct LevelPageTable(pub [PageEntry; 512]);

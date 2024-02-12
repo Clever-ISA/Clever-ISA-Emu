@@ -1,63 +1,17 @@
-use std::{
-    ops::{Deref, DerefMut},
-    sync::Arc,
-};
-
-use parking_lot::{RwLock, RwLockWriteGuard};
+use crate::cpu::SizeControl;
+use crate::primitive::*;
 
 pub trait IOPort {
-    fn matches_addr(&self, addr: u64) -> bool;
-    fn read(&mut self, size: u64) -> u64 {
-        0
-    }
-    fn write(&mut self, size: u64, val: u64) {}
+    fn matches(&self, addr: LeU64) -> bool;
+    fn read(&self, addr: LeU64, size: SizeControl) -> LeU64;
+    fn write(&self, addr: LeU64, val: LeU64, size: SizeControl);
 }
 
-pub trait IoMmuDevice {
-    fn matches_addr(&self, addr: u64) -> bool;
-
-    fn read(&mut self, bytes: &mut [u8]);
-
-    fn write(&mut self, bytes: &[u8]);
-}
-
-#[derive(Clone)]
-pub struct IOBus {
-    devices: Vec<Arc<RwLock<dyn IOPort>>>,
-}
-
-pub struct IOGuard<'a>(RwLockWriteGuard<'a, dyn IOPort>);
-
-impl Deref for IOGuard<'_> {
-    type Target = dyn IOPort;
-    fn deref(&self) -> &Self::Target {
-        &*self.0
+pub trait MMIODevice {
+    fn requires_align(&self) -> bool {
+        true
     }
-}
-
-impl DerefMut for IOGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut *self.0
-    }
-}
-
-impl IOBus {
-    pub const fn new() -> Self {
-        Self {
-            devices: Vec::new(),
-        }
-    }
-    pub fn register<I: IOPort + 'static>(&mut self, dev: I) {
-        self.devices.push(Arc::new(RwLock::new(dev)))
-    }
-    pub fn get_port_for_addr(&self, addr: u64) -> Option<IOGuard> {
-        for dev in &self.devices {
-            let read_lock = dev.read();
-            if read_lock.matches_addr(addr) {
-                drop(read_lock);
-                return Some(IOGuard(dev.write()));
-            }
-        }
-        None
-    }
+    fn matches(&self, addr: LeU64) -> bool;
+    fn read(&self, addr: LeU64, size: SizeControl) -> LeU64;
+    fn write(&self, addr: LeU64, val: LeU64, size: SizeControl);
 }
