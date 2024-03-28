@@ -1,0 +1,12 @@
+[package]
+name = "clever-emu-mem"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clever-emu-primitives.workspace = true
+rand.workspace = true
+bytemuck.workspace = true
+parking_lot = "0.12.1"
+parking_lot_core = "0.9.9"
+lru_time_cache = "0.11.11"

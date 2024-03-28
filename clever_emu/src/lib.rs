@@ -8,14 +8,8 @@ pub mod aci;
 
 pub mod error;
 
-pub mod float;
-
 pub mod mem;
 
 pub mod page;
-
-pub mod primitive;
-
-pub mod bitfield;
 
 pub mod util;

@@ -1,141 +1,31 @@
+pub mod cpuid;
 pub mod reg;
 pub mod state;
 pub mod ucode;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::mem::MaybeUninit;
 use std::rc::Rc;
 
-use crate::error::CPUException;
-use crate::error::{self, CPUResult};
+use crate::error::{self, CPUResult, FaultStatus};
+use crate::error::{CPUException, FaultCharacteristics};
 use crate::mem::{
     Cache, CacheAccessError, CacheAccessResult, CacheAttrs, CacheFetch, CacheInvalidate, CacheLine,
     CacheWrite, LocalMemory, LocalMemoryBus, Status,
 };
+use crate::page::*;
 use crate::primitive::*;
 
 use bytemuck::{Pod, Zeroable};
+use lru_time_cache::LruCache;
 
 use crate::util::*;
 
 use crate::bitfield::{bitfield, DisplayBitfield, FromBitfield, Sentinel};
 
-le_fake_enum! {
-    #[repr(LeU8)]
-    #[derive(PartialOrd, Ord)]
-    pub enum CpuExecutionMode{
-        Supervisor = 0,
-        User = 1,
-    }
-}
-
-impl CpuExecutionMode {
-    pub fn check_mode(self, required_rights: CpuExecutionMode) -> CPUResult<()> {
-        if self > required_rights {
-            Err(CPUException::SystemProtection(LeU64::new(0)))
-        } else {
-            Ok(())
-        }
-    }
-}
-
-bitfield! {
-    pub struct ExecutionMode : LeU8{
-        xm @ 0: CpuExecutionMode,
-        xmm @ 1: Sentinel<CpuExecutionMode>,
-    }
-}
-
-impl ExecutionMode {
-    #[inline]
-    pub fn from_mode(mode: CpuExecutionMode) -> Self {
-        Self::with_xm(mode) | Self::with_xmm(Sentinel(mode))
-    }
-
-    #[inline]
-    pub fn check_valid(self) -> error::CPUResult<()> {
-        if self.xm() != self.xmm().0 {
-            Err(error::CPUException::Undefined)
-        } else {
-            Ok(())
-        }
-    }
-
-    #[inline]
-    pub fn mode(self) -> CpuExecutionMode {
-        self.xm()
-    }
-}
-
-le_fake_enum! {
-    #[repr(LeU8)]
-    pub enum SizeControl{
-        Byte = 0,
-        Half = 1,
-        Word = 2,
-        Double = 3,
-        Quad = 4,
-    }
-}
-
-impl SizeControl {
-    #[inline]
-    pub fn as_bits(self) -> LeU64 {
-        LeU64::new(8) << self.0.unsigned_as::<LeU64>()
-    }
-
-    #[inline]
-    pub fn as_bytes(self) -> LeU64 {
-        LeU64::new(1) << self.0.unsigned_as::<LeU64>()
-    }
-
-    #[inline]
-    pub fn as_regwidth_mask(self) -> LeU64 {
-        LeU64::new(2) << (self.as_bits() - 1)
-    }
-
-    #[inline]
-    pub fn as_vectorwidth_mask(self) -> LeU128 {
-        LeU128::new(2) << (self.as_bits() - 1).unsigned_as::<LeU128>()
-    }
-}
-
-le_fake_enum! {
-    #[repr(LeU8)]
-    pub enum ShiftSizeControl{
-        Half = 0,
-        Word = 1,
-        Double = 2,
-        Quad = 3,
-    }
-}
-
-impl ShiftSizeControl {
-    #[inline]
-    pub fn as_size_control(self) -> SizeControl {
-        SizeControl(self.0 + 1)
-    }
-
-    #[inline]
-    pub fn as_bits(self) -> LeU64 {
-        LeU64::new(16) << self.0.unsigned_as::<LeU64>()
-    }
-
-    #[inline]
-    pub fn as_bytes(self) -> LeU64 {
-        LeU64::new(2) << self.0.unsigned_as::<LeU64>()
-    }
-
-    #[inline]
-    pub fn as_regwidth_mask(self) -> LeU64 {
-        LeU64::new(2) << (self.as_bits() - 1)
-    }
-
-    #[inline]
-    pub fn as_vectorwidth_mask(self) -> LeU128 {
-        LeU128::new(2) << (self.as_bits() - 1).unsigned_as::<LeU128>()
-    }
-}
+use self::reg::Regs;
+use self::state::RandUnit;
+use self::ucode::UCodeRom;
 
 le_fake_enum! {
     #[repr(LeU8)]
@@ -190,193 +80,6 @@ bitfield! {
     pub struct CleverSpecialBranch : BeU16{
         pub branch_opcode @ 0..4: BranchOpcode,
         pub rel @ 4: bool,
-    }
-}
-
-#[repr(transparent)]
-#[derive(Copy, Clone, Hash, PartialEq, Eq, Pod, Zeroable)]
-pub struct CleverRegister(pub u8);
-
-impl CleverRegister {
-    pub const fn get(self) -> u8 {
-        self.0
-    }
-}
-
-macro_rules! clever_registers{
-    {
-        $($name:ident $(| $altnames:ident)* => $val:expr),* $(,)?
-    } => {
-        #[allow(non_upper_case_globals)]
-        impl CleverRegister{
-            $(pub const $name: Self = Self($val); $(pub const $altnames: Self = Self($val);)*)*
-
-
-            pub const fn validate(self) -> bool{
-                match self{
-                    $(Self::$name => true,)*
-                    _ => false,
-                }
-            }
-        }
-
-        impl ::core::fmt::Display for CleverRegister{
-            fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result{
-                match self.0{
-                    $($val => f.write_str(::core::stringify!($name)),)*
-                    val => f.write_fmt(::core::format_args!("r{}",val))
-                }
-            }
-        }
-
-        impl ::core::fmt::Debug for CleverRegister{
-            fn fmt(&self, f: &mut core::fmt::Formatter) -> ::core::fmt::Result{
-                struct DontEscape(&'static str);
-                impl ::core::fmt::Debug for DontEscape{
-                    fn fmt(&self, f: &mut core::fmt::Formatter) -> ::core::fmt::Result{
-                        f.write_str(self.0)
-                    }
-                }
-
-                match self.0{
-                    $($val => {
-                        f.debug_tuple("CleverRegister")
-                            .field(&DontEscape(::core::stringify!($name))).finish()
-                    })*
-                    val => f.debug_tuple("CleverRegister").field(&val).finish()
-                }
-            }
-        }
-    }
-}
-
-clever_registers! {
-    r0 | racc => 0,
-    r1 | rsrc => 1,
-    r2 | rdst => 2,
-    r3 | rcnt => 3,
-    r4 => 4,
-    r5 => 5,
-    r6 | fbase => 6,
-    r7 | sptr => 7,
-    r8 => 8,
-    r9 => 9,
-    r10 => 10,
-    r11 => 11,
-    r12 => 12,
-    r13 => 13,
-    r14 => 14,
-    r15 | link => 15,
-    ip => 16,
-    flags => 17,
-    mode => 18,
-    fpcw => 19,
-    f0 => 24,
-    f1 => 25,
-    f2 => 26,
-    f3 => 27,
-    f4 => 28,
-    f5 => 29,
-    f6 => 30,
-    f7 => 31,
-    v0l => 64,
-    v0h => 65,
-    v1l => 66,
-    v1h => 67,
-    v2l => 68,
-    v2h => 69,
-    v3l => 70,
-    v3h => 71,
-    v4l => 72,
-    v4h => 73,
-    v5l => 74,
-    v5h => 75,
-    v6l => 76,
-    v6h => 77,
-    v7l => 78,
-    v7h => 79,
-    v8l => 80,
-    v8h => 81,
-    v9l => 82,
-    v9h => 83,
-    v10l => 84,
-    v10h => 85,
-    v11l => 86,
-    v11h => 87,
-    v12l => 88,
-    v12h => 89,
-    v13l => 90,
-    v13h => 91,
-    v14l => 92,
-    v14h => 93,
-    v15l => 94,
-    v15h => 95,
-    cr0 => 128,
-    page | cr1 => 129,
-    flprotected | cr2 => 130,
-    scdp | cr3 => 131,
-    scsp | cr4 => 132,
-    sccr | cr5 => 133,
-    itabp | cr6 => 134,
-    ciread | cr7 => 135,
-    cpuidlo => 136,
-    cpuidhi => 137,
-    cpuex2 => 138,
-    cpuex3 => 139,
-    cpuex4 => 140,
-    cpuex5 => 141,
-    cpuex6 => 142,
-    mscpuex => 143,
-    fcode | cr8 => 144,
-    pfchar | cr9 => 145,
-    msr0 => 148,
-    msr1 => 149,
-    msr2 => 150,
-    msr3 => 151,
-    msr4 => 152,
-    msr5 => 153,
-    msr6 => 154,
-    rdinfo => 156
-}
-
-impl<T: crate::bitfield::BitfieldTy> FromBitfield<T> for CleverRegister
-where
-    LeU8: FromBitfield<T>,
-{
-    fn from_bits(bits: T) -> Self {
-        Self(LeU8::from_bits(bits).get())
-    }
-
-    fn to_bits(self) -> T {
-        LeU8::new(self.0).to_bits()
-    }
-
-    fn validate(self) -> bool {
-        LeU8::new(self.0).validate() && self.validate()
-    }
-}
-
-impl DisplayBitfield for CleverRegister {
-    fn present(&self) -> bool {
-        true
-    }
-
-    fn display(&self, name: &str, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        use core::fmt::Display;
-        f.write_str(name)?;
-        f.write_str("(")?;
-        self.fmt(f)?;
-        f.write_str(")")
-    }
-}
-
-le_fake_enum! {
-    #[repr(LeU8)]
-    pub enum ProcessorState{
-        Halted = 0,
-        Paused = 1,
-        Reset = 0xE,
-        Running = 0xF,
     }
 }
 
@@ -665,72 +368,343 @@ impl<M: CacheWrite> DataCache<M> {
     }
 }
 
-pub struct InsnCache<M> {
-    l1icache: LocalMemory<M>,
+struct ICacheBuffer {
     fetch_line: LeU64,
     buffer: [BeU16; 32],
-    buffer_pos: usize,
+}
+
+pub struct InsnCache<M> {
+    l1icache: LocalMemory<M>,
+    buffer: RefCell<ICacheBuffer>,
+    buffer_pos: Cell<usize>,
+}
+
+impl ICacheBuffer {
+    const fn new() -> Self {
+        Self {
+            fetch_line: LeU64::new(0),
+            buffer: [BeU16::new(0); 32],
+        }
+    }
+    fn read_full_line_blocking<M: CacheFetch>(&mut self, mem: &M) -> CPUResult<()> {
+        let mut line = CacheLine::zeroed();
+
+        for i in (0usize..128).chain(core::iter::repeat(128)) {
+            match mem.read_line(self.fetch_line) {
+                Ok((l, _)) => line = l,
+                Err(CacheAccessError::Exception(ex)) => return Err(ex),
+                Err(CacheAccessError::Locked) => {
+                    if i < 16 {
+                        core::hint::spin_loop()
+                    } else if i < 128 {
+                        std::thread::yield_now()
+                    } else {
+                        mem.park_on_line_unlock(self.fetch_line)
+                    }
+                }
+                Err(e) => unreachable!("Should not be generated {:?}", e),
+            }
+        }
+
+        self.buffer = bytemuck::cast(line);
+
+        Ok(())
+    }
+    fn read_full_line<M: CacheFetch>(&mut self, mem: &M) -> CPUResult<()> {
+        let line = match mem.read_line(self.fetch_line) {
+            Ok((line, _)) => Ok(line),
+            Err(CacheAccessError::Exception(ex)) => Err(ex),
+            Err(CacheAccessError::Locked) => match mem.read_line(self.fetch_line) {
+                Ok((line, _)) => Ok(line),
+                Err(CacheAccessError::Exception(ex)) => Err(ex),
+                Err(CacheAccessError::Locked) => return self.read_full_line_blocking(mem),
+                Err(e) => unreachable!("Should not be generated {:?}", e),
+            },
+            Err(e) => unreachable!("Should not be generated {:?}", e),
+        }?;
+
+        self.buffer = bytemuck::cast(line);
+
+        Ok(())
+    }
 }
 
 impl<M> InsnCache<M> {
     pub fn new(underlying: M, l1isize: usize) -> Self {
         Self {
             l1icache: LocalMemory::new(underlying, l1isize),
-            fetch_line: LeU64::new(0),
-            buffer: [BeU16::new(0); 32],
-            buffer_pos: 32,
+            buffer: RefCell::new(ICacheBuffer::new()),
+            buffer_pos: Cell::new(32),
         }
     }
 }
 
 impl<M: CacheFetch> InsnCache<M> {
     pub fn reposition_after_jump(&self, phys_ip: LeU64) -> CPUResult<()> {
-        self.buffer_pos = ((phys_ip.get() >> 1) & 31) as usize;
-        if self.fetch_line != (phys_ip >> 6) {
-            self.fetch_line = phys_ip >> 6;
-            let line = match self.l1icache.read_line(self.fetch_line) {
-                Ok((line, _)) => line,
-                Err(CacheAccessError::Exception(ex)) => return Err(ex),
-                Err(CacheAccessError::Locked) => {
-                    match self.l1icache.read_line_without_probe(self.fetch_line) {
-                        Ok((line, _)) => line,
-                        Err(CacheAccessError::Exception(ex)) => return Err(ex),
-                        Err(CacheAccessError::Locked) => {
-                            let mut line = CacheLine::zeroed();
+        self.buffer_pos.set(((phys_ip.get() >> 1) & 31) as usize);
+        let fetch_line = self.buffer.borrow().fetch_line;
+        if fetch_line != (phys_ip >> 6) {
+            let mut buffer = self.buffer.borrow_mut();
+            buffer.fetch_line = phys_ip >> 6;
 
-                            for i in (0usize..128).chain(core::iter::repeat(128)) {
-                                match self.l1icache.read_line(self.fetch_line) {
-                                    Ok((l, _)) => line = l,
-                                    Err(CacheAccessError::Exception(ex)) => return Err(ex),
-                                    Err(CacheAccessError::Locked) => {
-                                        if i < 16 {
-                                            core::hint::spin_loop()
-                                        } else if i < 128 {
-                                            std::thread::yield_now()
-                                        } else {
-                                            self.l1icache.park_on_line_unlock(self.fetch_line)
-                                        }
-                                    }
-                                    Err(e) => unreachable!("Should not be generated {:?}", e),
-                                }
-                            }
-
-                            line
-                        }
-                        Err(e) => unreachable!("Should not be generated {:?}", e),
-                    }
-                }
-                Err(e) => unreachable!("Should not be generated {:?}", e),
-            };
-
-            self.buffer = bytemuck::cast(line);
+            buffer.read_full_line(&self.l1icache)?;
         }
 
         Ok(())
     }
+
+    pub fn reposition_after_page_boundary(&self, pg: LeU64) -> CPUResult<()> {
+        self.buffer_pos.set(0);
+        let fetch_line = self.buffer.borrow().fetch_line;
+        if fetch_line != (pg >> 6) {
+            let mut buffer = self.buffer.borrow_mut();
+            buffer.fetch_line = pg >> 6;
+
+            buffer.read_full_line(&self.l1icache)?;
+        }
+        Ok(())
+    }
+
+    pub fn fetch(&self) -> CPUResult<BeU16> {
+        let pos = self.buffer_pos.get();
+        let pos_next = pos + 1;
+        let overflow = (pos_next >> 5) != 0;
+        self.buffer_pos.set(pos_next & 31);
+        if overflow {
+            let mut buffer = self.buffer.borrow_mut();
+            buffer.fetch_line += 1;
+            buffer.read_full_line(&self.l1icache)?;
+        }
+        let val = self.buffer.borrow().buffer[pos_next & 31];
+
+        Ok(val)
+    }
 }
 
-pub struct Cpu {
+pub struct TlbBuffer {
+    backing: LruCache<LeI64, (PageEntry, CpuExecutionMode)>,
+}
+
+impl TlbBuffer {
+    pub fn new(tlb_entry_count: usize) -> Self {
+        Self {
+            backing: LruCache::with_capacity(tlb_entry_count),
+        }
+    }
+
+    pub fn resolve_addr<M: CacheFetch>(
+        &mut self,
+        mem: &M,
+        ptbl: LeU64,
+        vaddr: LeI64,
+        xm: CpuExecutionMode,
+        mut init_chars: FaultCharacteristics,
+    ) -> CPUResult<PageEntry> {
+        let vpage = vaddr >> 12;
+        if let Some((val, req)) = self.backing.get(&vpage) {
+            if *req < xm {
+                init_chars.flevel = LeU8::new(0);
+                init_chars.pref = val.bits();
+                init_chars.status |= FaultStatus::with_nested(true);
+                Err(CPUException::PageFault(vaddr, init_chars))
+            } else {
+                Ok(*val)
+            }
+        } else {
+            let mut paged_addr = vaddr.get();
+            let ptl = (ptbl & 7).get() as u32;
+
+            let mut addr_bits = 32 + ptl * 8;
+
+            let lead_bits = vaddr.leading_zeros() + vaddr.leading_ones();
+
+            if lead_bits < (65 - addr_bits) {
+                // Unused address bits must be copies of most significant bits
+
+                init_chars.flevel = LeU8::new(0);
+                init_chars.status |= FaultStatus::with_non_canonical(true);
+                return Err(CPUException::PageFault(vaddr, init_chars));
+            }
+
+            addr_bits -= 9;
+
+            let mut tail = addr_bits % 12;
+            if tail == 0 {
+                tail = 12;
+            }
+            paged_addr = paged_addr.rotate_left(tail as u32);
+            addr_bits -= tail;
+            let mut bits = paged_addr & ((1 << tail) - 1);
+            let mut pe = ptbl & 4095;
+            let mut pg_mode = CpuExecutionMode::User;
+            loop {
+                let addr = pe | ((bits as u64) << 3);
+                let offset = ((addr.get() & 0x3F) >> 3) as usize;
+                let line_addr = addr & !0x3F;
+
+                let line = match mem.read_line(line_addr) {
+                    Ok((line, _)) => line,
+                    Err(CacheAccessError::Exception(ex)) => return Err(ex),
+                    Err(CacheAccessError::Locked) => {
+                        let mut line = CacheLine::zeroed();
+                        for i in (0usize..).take(128).chain(core::iter::repeat(128)) {
+                            match mem.read_line(line_addr) {
+                                Ok((le, status)) => line = le,
+                                Err(CacheAccessError::Exception(ex)) => return Err(ex),
+                                Err(CacheAccessError::Locked) => {
+                                    if i < 16 {
+                                        core::hint::spin_loop()
+                                    } else if i < 128 {
+                                        std::thread::yield_now()
+                                    } else {
+                                        mem.park_on_line_unlock(line_addr)
+                                    }
+                                }
+                                Err(e) => unreachable!("Should not be generated {:?}", e),
+                            }
+                        }
+                        line
+                    }
+                    Err(e) => unreachable!("Should not be generated {:?}", e),
+                };
+
+                let entries: [PageEntry; CacheLine::SIZE >> 3] = bytemuck::cast(line);
+                let entry = entries[offset];
+                pe = entry.addr();
+                let flags = entry.flags();
+
+                if !flags.validate() {
+                    init_chars.pref = entry.bits();
+                    init_chars.status |= FaultStatus::with_validation_error(true);
+                    break;
+                }
+
+                if addr_bits != 0 {
+                    if !entry.npe_flags().validate() {
+                        init_chars.pref = entry.bits();
+                        init_chars.status |= FaultStatus::with_validation_error(true);
+                        break;
+                    }
+                }
+
+                if flags.perm() == 0 {
+                    init_chars.pref = entry.bits();
+                    break;
+                }
+                let mode = flags.xm().xm();
+                if mode < xm {
+                    init_chars.pref = entry.bits();
+                    init_chars.status |= FaultStatus::with_validation_error(true);
+                    break;
+                }
+
+                if mode < pg_mode {
+                    pg_mode = mode;
+                }
+
+                if addr_bits == 0 {
+                    self.backing.insert(vpage, (entry, pg_mode));
+                    return Ok(entry);
+                }
+            }
+
+            if addr_bits != 0 {
+                init_chars.status |= FaultStatus::with_nested(true);
+            }
+
+            init_chars.flevel = LeU8::new((addr_bits / 12) as u8);
+
+            Err(CPUException::PageFault(vaddr, init_chars))
+        }
+    }
+
+    pub fn flush_after_update(&mut self) {
+        self.backing.clear()
+    }
+}
+
+pub struct AddrResolver<M> {
+    buffer: RefCell<TlbBuffer>,
+    mem: M,
+    ptbl: LeU64,
+}
+
+impl<M> AddrResolver<M> {
+    pub fn new(mem: M, buffer_size: usize) -> Self {
+        AddrResolver {
+            mem,
+            buffer: RefCell::new(TlbBuffer::new(buffer_size)),
+            ptbl: LeU64::new(0),
+        }
+    }
+
+    pub fn set_ptbl(&mut self, ptbl: LeU64) {
+        self.ptbl = ptbl;
+        self.buffer.get_mut().flush_after_update();
+    }
+}
+
+impl<M: CacheFetch> AddrResolver<M> {
+    pub fn resolve_addr(
+        &self,
+        vaddr: LeI64,
+        xm: CpuExecutionMode,
+        init_chars: FaultCharacteristics,
+    ) -> CPUResult<PageEntry> {
+        self.buffer
+            .borrow_mut()
+            .resolve_addr(&self.mem, self.ptbl, vaddr, xm, init_chars)
+    }
+}
+
+pub struct Cpu<'a> {
     l2cache: Rc<LocalMemoryBus>,
-    l1dcache: DataCache<LocalMemory<Rc<LocalMemoryBus>>>,
+    l1dcache: DataCache<Rc<LocalMemoryBus>>,
+    l1icache: InsnCache<Rc<LocalMemoryBus>>,
+    addr_resolver: AddrResolver<Rc<LocalMemoryBus>>,
+    regs: Regs,
+    ucode_rom: UCodeRom<'a>,
+    state: RandUnit,
+    pending_exceptions: Vec<CPUException>,
+}
+
+impl<'a> Cpu<'a> {
+    pub fn new(
+        ucode_rom: UCodeRom<'a>,
+        l2cache: Rc<LocalMemoryBus>,
+        l1dsize: usize,
+        l1isize: usize,
+        tlb_buf_size: usize,
+    ) -> Cpu {
+        let l1dcache = DataCache::new(l2cache.clone(), l1dsize);
+        let l1icache = InsnCache::new(l2cache.clone(), l1isize);
+        let addr_resolver = AddrResolver::new(l2cache.clone(), tlb_buf_size);
+        Cpu {
+            l2cache,
+            l1dcache,
+            l1icache,
+            addr_resolver,
+            regs: Regs::new(),
+            ucode_rom,
+            state: RandUnit::new(),
+            pending_exceptions: vec![],
+        }
+    }
+
+    pub fn regs_mut(&mut self) -> &mut Regs {
+        &mut self.regs
+    }
+
+    pub fn regs(&self) -> &Regs {
+        &self.regs
+    }
+
+    pub fn init_after_reset(&mut self) {
+        self.regs = Regs::new();
+    }
+}
+
+pub struct CpuHolder<'a> {
+    l2cache: Rc<LocalMemoryBus>,
+    cpus: Vec<Cpu<'a>>,
 }

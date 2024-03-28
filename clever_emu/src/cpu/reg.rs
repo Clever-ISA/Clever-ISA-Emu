@@ -2,7 +2,7 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::{
     bitfield,
-    cpu::{CleverRegister, CpuExecutionMode, ExecutionMode, ShiftSizeControl},
+    cpu::{cpuid, CleverRegister, CpuExecutionMode, ExecutionMode, Extension, ShiftSizeControl},
     error::{CPUException, CPUResult},
     float::*,
     page::PgTab,
@@ -52,9 +52,13 @@ safe_union! {
         pub u32x4:  [LeU32;4],
         pub u16x8:  [LeU16;8],
         pub u8x16:  [LeU8;16],
+        #[cfg(feature = "float")]
         pub f128x1: CleverF128,
+        #[cfg(feature = "float")]
         pub f64x2:  [CleverF64;2],
+        #[cfg(feature = "float")]
         pub f32x4:  [CleverF32;4],
+        #[cfg(feature = "float")]
         pub f16x8:  [CleverF16;8],
     }
 }
@@ -112,12 +116,18 @@ bitfield! {
     pub struct Cr0 : LeU64{
         pub pg @ 0: bool,
         pub ie @ 1 : bool,
+        #[cfg(feature = "float")]
         pub fp @ 6 : bool,
+        #[cfg(feature = "float")]
         pub fpexcept @ 7: bool,
+        #[cfg(feature = "vector")]
         pub vec @ 8: bool,
+        #[cfg(feature = "rand")]
         pub xmrand @ 9: bool,
+        #[cfg(feature = "rand")]
         pub rpollinfo @ 10: bool,
-        pub haccell @ 11 : bool,
+        #[cfg(feature = "hash-accel")]
+        pub haccel @ 11 : bool,
     }
 }
 
@@ -127,6 +137,23 @@ impl Cr0 {
             Err(crate::error::CPUException::Undefined)
         } else {
             Ok(())
+        }
+    }
+
+    pub fn check_extension(&self, ex: Extension) -> CPUResult<()> {
+        match ex {
+            Extension::Main => Ok(()),
+            #[cfg(feature = "float")]
+            Extension::Float if self.fp() => Ok(()),
+            #[cfg(feature = "float-ext")]
+            Extension::FloatExt if self.fp() => Ok(()),
+            #[cfg(feature = "vector")]
+            Extension::Vector if self.vec() => Ok(()),
+            #[cfg(feature = "rand")]
+            Extension::XmRand if self.xmrand() => Ok(()),
+            #[cfg(feature = "hash-accel")]
+            Extension::Haccell if self.haccel() => Ok(()),
+            _ => Err(CPUException::Undefined),
         }
     }
 }
@@ -193,7 +220,10 @@ pub struct NamedRegs {
     pub mode: Mode,
     pub fpcw: Fpcw,
     reserved20: [LeU64; 4],
+    #[cfg(feature = "float")]
     pub fregs: [CleverFloatReg; 8],
+    #[cfg(not(feature = "float"))]
+    reserved24: [LeU64; 8],
     reserved32: [LeU64; 32],
     pub vreg: [VectorPair; 16],
     reserved96: [LeU64; 32],
@@ -239,9 +269,21 @@ impl core::ops::DerefMut for Regs {
 
 impl Regs {
     pub const fn new() -> Self {
-        Self {
+        let mut val = Self {
             array: [LeU64::new(0); 256],
-        }
+        };
+
+        val.named.ip = LeI64::new(0xFF00);
+        val.named.cpuid = cpuid::CPUID;
+        val.named.cpuex = [
+            cpuid::CPUEX2,
+            LeU64::new(0),
+            LeU64::new(0),
+            LeU64::new(0),
+            LeU64::new(0),
+            cpuid::MSCPUEX,
+        ];
+        val
     }
 
     pub fn validate_before_reading(
@@ -250,21 +292,26 @@ impl Regs {
         mode: CpuExecutionMode,
     ) -> CPUResult<()> {
         match regno {
-            CleverRegister(0..=19) | CleverRegister(24..=31) | CleverRegister(64..=95) => Ok(()),
-            CleverRegister(128..=135)
-            | CleverRegister::pfchar
-            | CleverRegister::fcode
-            | CleverRegister(156) => mode.check_mode(CpuExecutionMode::Supervisor),
+            CleverRegister(0..=18) => Ok(()),
+            CleverRegister(19) | CleverRegister(24..=31) => {
+                self.cr0.check_extension(Extension::Float)
+            }
+            CleverRegister(64..=95) => self.cr0.check_extension(Extension::Vector),
+            CleverRegister(128..=135) | CleverRegister::pfchar | CleverRegister::fcode => {
+                mode.check_mode(CpuExecutionMode::Supervisor)
+            }
             CleverRegister(v @ 136..=143) => {
                 let rno = v - 136;
 
                 let ciread = self.ciread;
-                if (ciread.bits() & (LeU64::new(1) << (rno as u64))) != LeU64::new(0) {
+                if (ciread.bits() & (LeU64::new(1) << (rno as u32))) != LeU64::new(0) {
                     Ok(())
                 } else {
                     mode.check_mode(CpuExecutionMode::Supervisor)
                 }
             }
+            #[cfg(feature = "rand")]
+            CleverRegister(156) => mode.check_mode(CpuExecutionMode::Supervisor),
             _ => Err(CPUException::Undefined),
         }
     }
@@ -276,12 +323,12 @@ impl Regs {
         mode: CpuExecutionMode,
     ) -> CPUResult<()> {
         match regno {
-            CleverRegister(0..=15)
-            | CleverRegister(24..=31)
-            | CleverRegister(64..=95)
-            | CleverRegister::flags => Ok(()),
+            CleverRegister(0..=15) | CleverRegister::flags => Ok(()),
             CleverRegister::ip | CleverRegister::mode => Err(crate::error::CPUException::Undefined),
+            CleverRegister(24..=31) => self.cr0.check_extension(Extension::Float),
+            CleverRegister(64..=95) => self.cr0.check_extension(Extension::Vector),
             CleverRegister::fpcw => {
+                self.cr0.check_extension(Extension::Float)?;
                 let fpcw = Fpcw::from_bits(val);
 
                 fpcw.check_valid()

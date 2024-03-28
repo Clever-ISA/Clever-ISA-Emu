@@ -1,0 +1,11 @@
+[package]
+name = "clever-emu-decode"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clever-emu-primitives.workspace = true
+clever-emu-regs.workspace = true
+clever-emu-types.workspace = true
+bytemuck.workspace = true
+paste.workspace = true

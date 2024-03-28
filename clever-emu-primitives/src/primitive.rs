@@ -89,6 +89,42 @@ macro_rules! impl_le_integers_arith{
     }
 }
 
+macro_rules! impl_le_integers_shifts{
+    {$(impl ::$($trait:ident)::+ for $le_int_ty:ident = $method:ident;)*} => {
+        $(
+            impl ::$($trait)::+ ::<u32> for $le_int_ty{
+                type Output = $le_int_ty;
+
+                #[inline]
+                fn $method(self, rhs: u32) -> $le_int_ty{
+                    $le_int_ty::new(self.get().$method(rhs))
+                }
+            }
+
+            impl ::$($trait)::+ ::<u32> for &$le_int_ty{
+                type Output = $le_int_ty;
+
+                #[inline]
+                fn $method(self, rhs: u32) -> $le_int_ty{
+                    $le_int_ty::new((*self).get().$method(rhs))
+                }
+            }
+        )*
+    }
+}
+
+macro_rules! impl_le_integer_shift_assigns{
+    {$(impl ::$($trait:ident)::+ for $le_int_ty:ident = $method:ident @ $op:tt;)*} => {
+        $(impl ::$($trait)::+ ::<u32> for $le_int_ty{
+
+            #[inline]
+            fn $method(&mut self, rhs: u32){
+                *self = *self $op rhs;
+            }
+        })*
+    }
+}
+
 macro_rules! impl_le_integers_arith_base_ty{
     {
         $(impl ::$($trait:ident)::+ <$base_ty:ident> for $le_int_ty:ident = $method:ident;)*
@@ -353,97 +389,107 @@ pub unsafe trait UnsignedAs<T: bytemuck::Pod>: bytemuck::Pod {
     const ZERO: T;
 }
 
-macro_rules! def_le_integers{
+macro_rules! def_fix_endian_integers{
     {
+        order $order:ident ($from_fixed_endian_name:ident: $to_fixed_endian_name:ident, $from_opposite_endian_name:ident: $to_opposite_endian_name:ident);
         $($vis:vis type $le_int_ty:ident = $base_ty:ident;)*
     } => {
         $(
-            #[doc = concat!("A [`", stringify!($base_ty), "`] that is represented in memory as little-endian")]
+            #[doc = concat!("A [`", stringify!($base_ty), "`] that is represented in memory as", stringify!($order), "-endian")]
             #[repr(transparent)]
             #[derive(Copy, Clone, Default, PartialEq, Eq, bytemuck::Zeroable, bytemuck::Pod)]
             $vis struct $le_int_ty($base_ty);
 
             impl $le_int_ty{
+
+                pub const BITS: u32 = $base_ty::BITS;
+
+                pub const MIN: Self = Self::new($base_ty::MIN);
+                pub const MAX: Self = Self::new($base_ty::MAX);
+
                 #[doc = concat!("Constructs an [`", stringify!($le_int_ty), "`] from it's base type. On big-endian platforms, this swaps the bytes of `x`")]
                 $vis const fn new(x: $base_ty) -> Self{
-                    Self(x.to_le())
+                    Self::$from_fixed_endian_name(x.$to_fixed_endian_name())
                 }
 
                 #[doc = concat!("Converts a [`", stringify!($le_int_ty), "`] to it's base type. On big-endian platforms, this swaps the bytes of `x`")]
                 $vis const fn get(self) -> $base_ty{
-                    self.0.to_le()
+                    $base_ty::$from_fixed_endian_name(self.$to_fixed_endian_name())
                 }
 
 
                 #[doc = concat!("Constructs a [`", stringify!($le_int_ty), "`] from the raw LE bytes. This is zero cost on all platforms")]
-                $vis const fn from_le_bytes(x: [u8;core::mem::size_of::<Self>()]) -> Self{
+                $vis const fn $from_fixed_endian_name(x: [u8;core::mem::size_of::<Self>()]) -> Self{
                     Self(<$base_ty>::from_ne_bytes(x))
                 }
 
                 #[doc = concat!("Constructs a [`", stringify!($le_int_ty), "`] from the raw BE bytes. This swaps bytes on all platforms")]
-                $vis const fn from_be_bytes(x: [u8;core::mem::size_of::<Self>()]) -> Self{
+                $vis const fn $from_opposite_endian_name(x: [u8;core::mem::size_of::<Self>()]) -> Self{
                     Self(<$base_ty>::from_ne_bytes(x).swap_bytes())
                 }
 
                 #[doc = concat!("Constructs a [`", stringify!($le_int_ty), "`] from the raw bytes in native order. This swaps bytes on big-endian platforms\n",
                 "This is equivalent to [`", stringify!($le_int_ty), "::new`] called with the result of [`", stringify!($base_ty),"::from_ne_bytes`]")]
                 $vis const fn from_ne_bytes(x: [u8;core::mem::size_of::<Self>()]) -> Self{
-                    Self(<$base_ty>::from_ne_bytes(x).to_le())
+                    Self::new(<$base_ty>::$from_fixed_endian_name(x))
                 }
 
                 #[doc = concat!("Converts a [`", stringify!($le_int_ty), "`] to the raw LE bytes. This is zero cost on all platforms")]
-                $vis const fn to_le_bytes(self) -> [u8;core::mem::size_of::<Self>()]{
+                $vis const fn $to_fixed_endian_name(self) -> [u8;core::mem::size_of::<Self>()]{
                     self.0.to_ne_bytes()
                 }
 
                 #[doc = concat!("Converts a [`", stringify!($le_int_ty), "`] to the raw BE bytes. This swaps bytes on all platforms")]
-                $vis const fn to_be_bytes(self) -> [u8;core::mem::size_of::<Self>()]{
+                $vis const fn $to_opposite_endian_name(self) -> [u8;core::mem::size_of::<Self>()]{
                     self.0.swap_bytes().to_ne_bytes()
                 }
 
                 #[doc = concat!("Converts a [`", stringify!($le_int_ty), "`] to the raw bytes in native order. This swaps bytes on big-endian platforms")]
                 $vis const fn to_ne_bytes(self) -> [u8;core::mem::size_of::<Self>()]{
-                    self.0.to_le().to_ne_bytes()
+                    self.get().to_ne_bytes()
                 }
 
-                $vis const fn truncate_to<T>(self) -> T where T: Truncate<Self>{
-                    union Bytes<T: Copy>{
-                        base: [u8;core::mem::size_of::<$le_int_ty>()],
-                        interleave: T
-                    }
-
-                    let bytes = Bytes::<T>{
-                        base: [0u8;core::mem::size_of::<Self>()]
-                    };
-                    unsafe{bytes.interleave}
+                $vis const fn leading_zeros(self) -> u32{
+                    self.get().leading_zeros()
                 }
 
-                $vis const fn unsigned_as<T: ::bytemuck::Pod>(self) -> T where Self: UnsignedAs<T>{
-                    union Bytes<T: Copy, U: Copy>{
-                        this: T,
-                        result: U
-                    }
-
-                    let mut base = Bytes{
-                        result: Self::ZERO
-                    };
-                    base.this = self;
-
-                    unsafe{base.result}
+                $vis const fn trailing_zeros(self) -> u32{
+                    self.get().trailing_zeros()
                 }
 
-                $vis const fn unsigned_as_from<T: ::bytemuck::Pod>(val: T) -> Self where T: UnsignedAs<Self>{
-                    union Bytes<T: Copy, U: Copy>{
-                        this: T,
-                        result: U
-                    }
+                $vis const fn count_zeros(self) -> u32{
+                    self.get().count_zeros()
+                }
 
-                    let mut base = Bytes{
-                        this: Self::new(0)
-                    };
-                    base.result = val;
+                $vis const fn leading_ones(self) -> u32{
+                    self.get().leading_ones()
+                }
 
-                    unsafe{base.this}
+                $vis const fn trailing_ones(self) -> u32{
+                    self.get().trailing_ones()
+                }
+
+                $vis const fn count_ones(self) -> u32{
+                    self.get().count_ones()
+                }
+
+                $vis const fn rotate_left(self, val: u32) -> Self{
+                    Self::new(self.get().rotate_left(val))
+                }
+                $vis const fn rotate_right(self, val: u32) -> Self{
+                    Self::new(self.get().rotate_right(val))
+                }
+
+                $vis const fn wrapping_add(self, val: $le_int_ty) -> Self{
+                    Self::new(self.get().wrapping_add(val.get()))
+                }
+
+                $vis const fn wrapping_sub(self, val: $le_int_ty) -> Self{
+                    Self::new(self.get().wrapping_sub(val.get()))
+                }
+
+                $vis const fn wrapping_mul(self, val: $le_int_ty) -> Self{
+                    Self::new(self.get().wrapping_mul(val.get()))
                 }
             }
 
@@ -541,8 +587,6 @@ macro_rules! def_le_integers{
                 impl ::core::ops::Mul<$base_ty> for $le_int_ty = mul;
                 impl ::core::ops::Div<$base_ty> for $le_int_ty = div;
                 impl ::core::ops::Rem<$base_ty> for $le_int_ty = rem;
-                impl ::core::ops::Shr<$base_ty> for $le_int_ty = shr;
-                impl ::core::ops::Shl<$base_ty> for $le_int_ty = shl;
                 impl ::core::ops::BitAnd<$base_ty> for $le_int_ty = bitand;
                 impl ::core::ops::BitOr<$base_ty> for $le_int_ty = bitor;
                 impl ::core::ops::BitXor<$base_ty> for $le_int_ty = bitxor;
@@ -570,10 +614,17 @@ macro_rules! def_le_integers{
                 impl ::core::ops::MulAssign<$base_ty> for $le_int_ty = mul_assign @ *;
                 impl ::core::ops::DivAssign<$base_ty> for $le_int_ty = div_assign @ /;
                 impl ::core::ops::RemAssign<$base_ty> for $le_int_ty = rem_assign @ %;
-                impl ::core::ops::ShrAssign<$base_ty> for $le_int_ty = shr_assign @ >>;
-                impl ::core::ops::ShlAssign<$base_ty> for $le_int_ty = shl_assign @ <<;
             }
 
+            impl_le_integers_shifts!{
+                impl ::core::ops::Shr for $le_int_ty = shr;
+                impl ::core::ops::Shl for $le_int_ty = shl;
+            }
+
+            impl_le_integer_shift_assigns!{
+                impl ::core::ops::ShrAssign for $le_int_ty = shr_assign @ >>;
+                impl ::core::ops::ShlAssign for $le_int_ty = shl_assign @ <<;
+            }
         )*
     }
 }
@@ -597,12 +648,12 @@ macro_rules! impl_le_integers_cast_sign{
         $(
             impl $signed_ty{
                 pub const fn cast_sign(self) -> $unsigned_ty{
-                    <$unsigned_ty>::from_le_bytes(self.to_le_bytes())
+                    $crate::const_transmute_safe(self)
                 }
             }
             impl $unsigned_ty{
                 pub const fn cast_sign(self) -> $signed_ty{
-                    <$signed_ty>::from_le_bytes(self.to_le_bytes())
+                    $crate::const_transmute_safe(self)
                 }
             }
         )*
@@ -615,6 +666,37 @@ macro_rules! impl_le_integers_from{
             impl ::core::convert::From<$other_ty> for $le_int_ty{
                 fn from(x: $other_ty) -> Self{
                     Self::new(x.get().into())
+                }
+            }
+        )*
+    }
+}
+
+macro_rules! impl_le_integers_unsigned_as_truncate{
+    ($($le_int_ty:ident),*) => {
+        $(
+            impl $le_int_ty{
+                pub const fn unsigned_as<T: bytemuck::Pod>(self) ->T where Self: UnsignedAs<T>{
+                    union Transmuter<T>{
+                        this: $le_int_ty,
+                        other: core::mem::ManuallyDrop<T>
+                    }
+
+                    let mut transmuter = Transmuter{other: core::mem::ManuallyDrop::new(Self::ZERO)};
+                    transmuter.this = self;
+
+
+                    unsafe{core::mem::ManuallyDrop::into_inner(transmuter.other)}
+                }
+                pub const fn truncate_to<T>(self) -> T where T: Truncate<Self>{
+                    union Transmuter<T>{
+                        this: $le_int_ty,
+                        other: core::mem::ManuallyDrop<T>
+                    }
+
+                    let transmuter = Transmuter{this: self};
+
+                    unsafe{core::mem::ManuallyDrop::into_inner(transmuter.other)}
                 }
             }
         )*
@@ -688,7 +770,8 @@ macro_rules! impl_le_integers_truncate{
     }
 }
 
-def_le_integers! {
+def_fix_endian_integers! {
+    order little (from_le_bytes: to_le_bytes, from_be_bytes: to_be_bytes);
     pub type LeI8 = i8;
     pub type LeU8 = u8;
     pub type LeI16 = i16;
@@ -699,6 +782,24 @@ def_le_integers! {
     pub type LeU64 = u64;
     pub type LeI128 = i128;
     pub type LeU128 = u128;
+}
+
+impl_le_integers_unsigned_as_truncate! {
+    LeI8, LeU8, LeI16, LeU16, LeI32, LeU32, LeI64, LeU64, LeI128, LeU128
+}
+
+def_fix_endian_integers! {
+    order big (from_le_bytes: to_le_bytes, from_be_bytes: to_be_bytes);
+    pub type BeI8 = i8;
+    pub type BeU8 = u8;
+    pub type BeI16 = i16;
+    pub type BeU16 = u16;
+    pub type BeI32 = i32;
+    pub type BeU32 = u32;
+    pub type BeI64 = i64;
+    pub type BeU64 = u64;
+    pub type BeI128 = i128;
+    pub type BeU128 = u128;
 }
 
 impl_le_integers_neg!(LeI8, LeI16, LeI32, LeI64, LeI128);
@@ -925,204 +1026,6 @@ macro_rules! le_fake_enum{
 }
 
 pub use le_fake_enum;
-
-macro_rules! def_be_integers{
-    {
-        $($vis:vis type $be_int_ty:ident = $base_ty:ident;)*
-    } => {
-        $(
-            #[doc = concat!("A [`", stringify!($base_ty), "`] that is represented in memory as little-endian")]
-            #[repr(transparent)]
-            #[derive(Copy, Clone, Default, PartialEq, Eq, bytemuck::Zeroable, bytemuck::Pod)]
-            $vis struct $be_int_ty($base_ty);
-
-            impl $be_int_ty{
-                #[doc = concat!("Constructs an [`", stringify!($be_int_ty), "`] from it's base type. On little-endian platforms, this swaps the bytes of `x`")]
-                $vis const fn new(x: $base_ty) -> Self{
-                    Self(x.to_le())
-                }
-
-                #[doc = concat!("Converts a [`", stringify!($be_int_ty), "`] to it's base type. On little-endian platforms, this swaps the bytes of `x`")]
-                $vis const fn get(self) -> $base_ty{
-                    self.0.to_le()
-                }
-
-
-                #[doc = concat!("Constructs a [`", stringify!($be_int_ty), "`] from the raw BE bytes. This is zero cost on all platforms")]
-                $vis const fn from_be_bytes(x: [u8;core::mem::size_of::<Self>()]) -> Self{
-                    Self(<$base_ty>::from_ne_bytes(x))
-                }
-
-                #[doc = concat!("Constructs a [`", stringify!($be_int_ty), "`] from the raw LE bytes. This swaps bytes on all platforms")]
-                $vis const fn from_le_bytes(x: [u8;core::mem::size_of::<Self>()]) -> Self{
-                    Self(<$base_ty>::from_ne_bytes(x).swap_bytes())
-                }
-
-                #[doc = concat!("Constructs a [`", stringify!($be_int_ty), "`] from the raw bytes in native order. This swaps bytes on little-endian platforms\n",
-                "This is equivalent to [`", stringify!($be_int_ty), "::new`] called with the result of [`", stringify!($base_ty),"::from_ne_bytes`]")]
-                $vis const fn from_ne_bytes(x: [u8;core::mem::size_of::<Self>()]) -> Self{
-                    Self(<$base_ty>::from_ne_bytes(x).to_be())
-                }
-
-                #[doc = concat!("Converts a [`", stringify!($be_int_ty), "`] to the raw BE bytes. This is zero cost on all platforms")]
-                $vis const fn to_be_bytes(self) -> [u8;core::mem::size_of::<Self>()]{
-                    self.0.to_ne_bytes()
-                }
-
-                #[doc = concat!("Converts a [`", stringify!($be_int_ty), "`] to the raw LE bytes. This swaps bytes on all platforms")]
-                $vis const fn to_le_bytes(self) -> [u8;core::mem::size_of::<Self>()]{
-                    self.0.swap_bytes().to_ne_bytes()
-                }
-
-                #[doc = concat!("Converts a [`", stringify!($be_int_ty), "`] to the raw bytes in native order. This swaps bytes on little-endian platforms")]
-                $vis const fn to_ne_bytes(self) -> [u8;core::mem::size_of::<Self>()]{
-                    self.0.to_be().to_ne_bytes()
-                }
-            }
-
-            impl ::core::convert::From<$base_ty> for $be_int_ty{
-                fn from(x: $base_ty) -> Self{
-                    Self::new(x)
-                }
-            }
-
-            impl ::core::convert::From<$be_int_ty> for $base_ty{
-                fn from(x: $be_int_ty) -> Self{
-                    x.get()
-                }
-            }
-
-            impl ::core::convert::From<&$base_ty> for $be_int_ty{
-                fn from(x: &$base_ty) -> Self{
-                    Self::new(*x)
-                }
-            }
-
-            impl ::core::convert::From<&$be_int_ty> for $base_ty{
-                fn from(x: &$be_int_ty) -> Self{
-                    x.get()
-                }
-            }
-
-            impl ::core::hash::Hash for $be_int_ty{
-                fn hash<H: ::core::hash::Hasher>(&self, state: &mut H){
-                    let val = self.get();
-                    val.hash(state)
-                }
-            }
-
-            impl ::core::cmp::Ord for $be_int_ty{
-                #[inline]
-                fn cmp(&self, other: &Self) -> ::core::cmp::Ordering{
-                    let this = self.get();
-                    let other = other.get();
-
-                    this.cmp(&other)
-                }
-            }
-
-            impl ::core::ops::Not for $be_int_ty{
-                type Output = Self;
-                #[inline]
-                fn not(self) -> Self{
-                    Self(!self.0)
-                }
-            }
-
-            impl_le_integers_cmp_ref_only!{
-                impl ::core::cmp::PartialEq for $be_int_ty = eq -> bool;
-            }
-
-            impl_le_integers_cmp!{
-                impl ::core::cmp::PartialOrd for $be_int_ty = partial_cmp -> ::core::option::Option<::core::cmp::Ordering>;
-            }
-            impl_le_integers_cmp_base_ty!{
-                impl ::core::cmp::PartialEq<$base_ty> for $be_int_ty = eq -> bool;
-                impl ::core::cmp::PartialOrd<$base_ty> for $be_int_ty = partial_cmp -> ::core::option::Option<::core::cmp::Ordering>;
-            }
-
-            impl_le_integers_fmt!{
-                impl ::core::fmt::Display for $be_int_ty;
-                impl ::core::fmt::Debug for $be_int_ty;
-                impl ::core::fmt::UpperHex for $be_int_ty;
-                impl ::core::fmt::LowerHex for $be_int_ty;
-                impl ::core::fmt::UpperExp for $be_int_ty;
-                impl ::core::fmt::LowerExp for $be_int_ty;
-                impl ::core::fmt::Octal for $be_int_ty;
-                impl ::core::fmt::Binary for $be_int_ty;
-            }
-
-            impl_le_integers_logic!{
-                impl ::core::ops::BitAnd for $be_int_ty = bitand;
-                impl ::core::ops::BitOr for $be_int_ty = bitor;
-                impl ::core::ops::BitXor for $be_int_ty = bitxor;
-            }
-
-            impl_le_integers_arith!{
-                impl ::core::ops::Add for $be_int_ty = add;
-                impl ::core::ops::Sub for $be_int_ty = sub;
-                impl ::core::ops::Mul for $be_int_ty = mul;
-                impl ::core::ops::Div for $be_int_ty = div;
-                impl ::core::ops::Rem for $be_int_ty = rem;
-                impl ::core::ops::Shr for $be_int_ty = shr;
-                impl ::core::ops::Shl for $be_int_ty = shl;
-            }
-
-            impl_le_integers_arith_base_ty!{
-                impl ::core::ops::Add<$base_ty> for $be_int_ty = add;
-                impl ::core::ops::Sub<$base_ty> for $be_int_ty = sub;
-                impl ::core::ops::Mul<$base_ty> for $be_int_ty = mul;
-                impl ::core::ops::Div<$base_ty> for $be_int_ty = div;
-                impl ::core::ops::Rem<$base_ty> for $be_int_ty = rem;
-                impl ::core::ops::Shr<$base_ty> for $be_int_ty = shr;
-                impl ::core::ops::Shl<$base_ty> for $be_int_ty = shl;
-                impl ::core::ops::BitAnd<$base_ty> for $be_int_ty = bitand;
-                impl ::core::ops::BitOr<$base_ty> for $be_int_ty = bitor;
-                impl ::core::ops::BitXor<$base_ty> for $be_int_ty = bitxor;
-            }
-
-            impl_le_integers_op_assign!{
-                impl ::core::ops::AddAssign for $be_int_ty = add_assign @ +;
-                impl ::core::ops::SubAssign for $be_int_ty = sub_assign @ -;
-                impl ::core::ops::BitAndAssign for $be_int_ty = bitand_assign @ &;
-                impl ::core::ops::BitOrAssign for $be_int_ty = bitor_assign @ |;
-                impl ::core::ops::BitXorAssign for $be_int_ty = bitxor_assign @ ^;
-                impl ::core::ops::MulAssign for $be_int_ty = mul_assign @ *;
-                impl ::core::ops::DivAssign for $be_int_ty = div_assign @ /;
-                impl ::core::ops::RemAssign for $be_int_ty = rem_assign @ %;
-                impl ::core::ops::ShrAssign for $be_int_ty = shr_assign @ >>;
-                impl ::core::ops::ShlAssign for $be_int_ty = shl_assign @ <<;
-            }
-
-            impl_le_integers_op_assign_base_ty!{
-                impl ::core::ops::AddAssign<$base_ty> for $be_int_ty = add_assign @ +;
-                impl ::core::ops::SubAssign<$base_ty> for $be_int_ty = sub_assign @ -;
-                impl ::core::ops::BitAndAssign<$base_ty> for $be_int_ty = bitand_assign @ &;
-                impl ::core::ops::BitOrAssign<$base_ty> for $be_int_ty = bitor_assign @ |;
-                impl ::core::ops::BitXorAssign<$base_ty> for $be_int_ty = bitxor_assign @ ^;
-                impl ::core::ops::MulAssign<$base_ty> for $be_int_ty = mul_assign @ *;
-                impl ::core::ops::DivAssign<$base_ty> for $be_int_ty = div_assign @ /;
-                impl ::core::ops::RemAssign<$base_ty> for $be_int_ty = rem_assign @ %;
-                impl ::core::ops::ShrAssign<$base_ty> for $be_int_ty = shr_assign @ >>;
-                impl ::core::ops::ShlAssign<$base_ty> for $be_int_ty = shl_assign @ <<;
-            }
-
-        )*
-    }
-}
-
-def_be_integers! {
-    pub type BeI8 = i8;
-    pub type BeU8 = u8;
-    pub type BeI16 = i16;
-    pub type BeU16 = u16;
-    pub type BeI32 = i32;
-    pub type BeU32 = u32;
-    pub type BeI64 = i64;
-    pub type BeU64 = u64;
-    pub type BeI128 = i128;
-    pub type BeU128 = u128;
-}
 
 impl_le_integers_neg!(BeI8, BeI16, BeI32, BeI64, BeI128);
 

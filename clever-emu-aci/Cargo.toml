@@ -1,0 +1,9 @@
+[package]
+name = "clever-emu-aci"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aci-registry.workspace = true
+aci-firmware-hal.workspace = true
+clever-emu-primitives.workspace = true

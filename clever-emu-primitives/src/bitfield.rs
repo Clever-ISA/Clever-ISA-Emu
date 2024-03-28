@@ -1,15 +1,21 @@
+#[doc(hidden)]
+pub mod __exports {
+    pub use bytemuck::{Pod, Zeroable};
+    pub use paste::paste;
+}
+
 #[macro_export]
 macro_rules! bitfield{
     {
         $(#[$meta:meta])*
         $vis:vis struct $bitfield_ty:ident : $base_ty:ty{
-            $($vis2:vis $field_name:ident @ $placement_start:literal $(.. $placement_end:literal)? : $ty:ty ),*
+            $($(#[$meta2:meta])* $vis2:vis $field_name:ident @ $placement_start:literal $(.. $placement_end:literal)? : $ty:ty ),*
             $(,)?
         }
     } => {
 
         $(#[$meta])*
-        #[derive(Copy, Clone, PartialEq, Eq, Hash, Default, Debug, bytemuck::Zeroable, bytemuck::Pod)]
+        #[derive(Copy, Clone, PartialEq, Eq, Hash, Default, Debug, $crate::bitfield::__exports::Zeroable, $crate::bitfield::__exports::Pod)]
         #[repr(transparent)]
         $vis struct $bitfield_ty($base_ty);
 
@@ -34,7 +40,7 @@ macro_rules! bitfield{
                 let mut field = <$base_ty>::new(0);
                 let mut fields_valid = true;
 
-                $({
+                $($(#[$meta2])*{
                     let placement = $placement_start $(.. $placement_end)?;
                     field |= $crate::bitfield::BitfieldPosition::insert(&placement, <$base_ty>::new(!0));
                     fields_valid |= $crate::bitfield::FromBitfield::<$base_ty>::validate(self. $field_name ());
@@ -45,6 +51,7 @@ macro_rules! bitfield{
 
             $(
                 #[inline]
+                $(#[$meta2])*
                 $vis2 fn $field_name(&self) -> $ty{
                     let placement = $placement_start $(.. $placement_end)?;
                     let bits = $crate::bitfield::BitfieldPosition::extract(&placement,self.0);
@@ -52,8 +59,9 @@ macro_rules! bitfield{
                     $crate::bitfield::FromBitfield::from_bits(bits)
                 }
 
-                paste::paste!{
+                $crate::bitfield::__exports::paste!{
                     #[inline]
+                    $(#[$meta2])*
                     $vis2 fn [<with_ $field_name>](val: $ty) -> Self{
                         let placement = $placement_start $(.. $placement_end)?;
 
@@ -316,40 +324,6 @@ impl_from_bitfield_identity_and_bool!(
     LeU8, LeU16, LeU32, LeU64, LeU128, BeU8, BeU16, BeU32, BeU64, BeU128
 );
 
-macro_rules! impl_from_bitfield_be_to_le{
-    {
-        $($be_ty:ident => $le_ty:ident),*
-    } => {
-        $(
-            impl FromBitfield<$le_ty> for $be_ty{
-                fn from_bits(bits: $le_ty) -> Self{
-                    bits.to_be()
-                }
-                fn to_bits(self) -> $le_ty{
-                    self.to_le()
-                }
-            }
-            impl FromBitfield<$be_ty> for $le_ty{
-                fn from_bits(bits: $be_ty) -> Self{
-                    bits.to_le()
-                }
-
-                fn to_bits(self) -> $be_ty{
-                    self.to_be()
-                }
-            }
-        )*
-    }
-}
-
-impl_from_bitfield_be_to_le! {
-    BeU8 => LeU8,
-    BeU16 => LeU16,
-    BeU32 => LeU32,
-    BeU64 => LeU64,
-    BeU128 => LeU128
-}
-
 macro_rules! impl_bitfield_trunc_to_le{
     {
         $($be_ty:ident: $($le_ty:ident),*;)*
@@ -358,11 +332,20 @@ macro_rules! impl_bitfield_trunc_to_le{
             $(
                 impl FromBitfield<$be_ty> for $le_ty{
                     fn from_bits(bits: $be_ty) -> Self{
-                        bits.to_le().truncate_to()
+                        bits.to_le().unsigned_as()
                     }
 
                     fn to_bits(self) -> $be_ty{
                         <$be_ty>::from_le(self.unsigned_as())
+                    }
+                }
+
+                impl FromBitfield<$le_ty> for $be_ty{
+                    fn from_bits(bits: $le_ty) -> Self{
+                        <$be_ty>::from_le(bits.unsigned_as())
+                    }
+                    fn to_bits(self) -> $le_ty{
+                        self.to_le().unsigned_as()
                     }
                 }
             )*
@@ -371,10 +354,40 @@ macro_rules! impl_bitfield_trunc_to_le{
 }
 
 impl_bitfield_trunc_to_le! {
-    BeU16: LeU8;
-    BeU32: LeU16, LeU8;
-    BeU64: LeU32, LeU16, LeU8;
-    BeU128: LeU64, LeU32, LeU16, LeU8;
+    BeU8  : LeU128, LeU64, LeU32, LeU16, LeU8;
+    BeU16 : LeU128, LeU64, LeU32, LeU16, LeU8;
+    BeU32 : LeU128, LeU64, LeU32, LeU16, LeU8;
+    BeU64 : LeU128, LeU64, LeU32, LeU16, LeU8;
+    BeU128: LeU128, LeU64, LeU32, LeU16, LeU8;
+}
+
+macro_rules! impl_bitfield_trunc_to_be{
+    {
+        $($be_ty:ident: $($be_ty2:ident),*;)*
+    } => {
+        $(
+            $(
+                impl FromBitfield<$be_ty> for $be_ty2{
+                    fn from_bits(bits: $be_ty) -> Self{
+                        Self::from_le(bits.to_le().unsigned_as())
+                    }
+
+                    fn to_bits(self) -> $be_ty{
+                        <$be_ty>::from_le(self.to_le().unsigned_as())
+                    }
+                }
+
+            )*
+        )*
+    }
+}
+
+impl_bitfield_trunc_to_be! {
+    BeU8  : BeU128, BeU64, BeU32, BeU16;
+    BeU16 : BeU128, BeU64, BeU32, BeU8 ;
+    BeU32 : BeU128, BeU64, BeU16, BeU8 ;
+    BeU64 : BeU128, BeU32, BeU16, BeU8 ;
+    BeU128: BeU64 , BeU32, BeU16, BeU8 ;
 }
 
 /// A bitfield element that is a "Sentinel"
@@ -419,7 +432,7 @@ unsafe impl<T: bytemuck::Zeroable, const N: u64> bytemuck::Zeroable for FixedFie
 
 impl<R: BitfieldTy + Pod, T: FromBitfield<R>, const N: u64> FromBitfield<R> for FixedField<T, N>
 where
-    LeU64: UnsignedAs<R>,
+    LeU64: FromBitfield<R>,
     R: PartialEq,
     T: Copy,
 {
@@ -432,7 +445,7 @@ where
     }
 
     fn validate(self) -> bool {
-        self.0.validate() && (self.to_bits() == LeU64::new(N).unsigned_as::<R>())
+        self.0.validate() && (LeU64::from_bits(self.to_bits()) == LeU64::new(N))
     }
 }
 
@@ -488,4 +501,6 @@ macro_rules! impl_display_bitfield_integer {
     };
 }
 
-impl_display_bitfield_integer!(LeU8, LeU16, LeU32, LeU64, LeU128);
+impl_display_bitfield_integer!(
+    LeU8, LeU16, LeU32, LeU64, LeU128, BeU8, BeU16, BeU32, BeU64, BeU128
+);

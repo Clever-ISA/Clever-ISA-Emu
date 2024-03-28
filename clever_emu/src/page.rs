@@ -91,29 +91,6 @@ bitfield! {
     }
 }
 
-bitfield! {
-    pub struct PgTab : LeU64{
-        pub ptl @ 0..3 : LeU8,
-        pub addr @ 12..64 : LeU64,
-    }
-}
-
-impl PgTab {
-    pub fn page_addr(self) -> LeU64 {
-        self.addr() << 12
-    }
-
-    pub fn check_valid(self) -> CPUResult<()> {
-        if !self.validate() {
-            Err(CPUException::Undefined)
-        } else if self.ptl() > 4 {
-            Err(CPUException::Undefined)
-        } else {
-            Ok(())
-        }
-    }
-}
-
 impl PageEntry {
     pub fn lpe_flags(self) -> LpeBits {
         LpeBits::from_bits(self.flags().bits())

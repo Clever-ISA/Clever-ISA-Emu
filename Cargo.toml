@@ -1,31 +1,18 @@
-[package]
-name = "clever-isa-emu"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+members = [ "clever-emu-aci", "clever-emu-decode", "clever-emu-errors", "clever-emu-mem", "clever-emu-primitives", "clever-emu-regs", "clever-emu-types"]
+resolver = "2"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[features]
-
-float = [] # X-float
-# decimal-fp = ["fp","decimal"]
-vector = [] # X-vector
-float-ext = ["float"] # X-float-ext
-rand = [] # X-rand
-aci = []
-wpgu = ["dep:wgpu", "dep:winit", "aci"]
-'clever1.0' = ["float", "vector", "float-ext"]
-hash-accel = []
-
-[dependencies]
-parking_lot = "0.11.1"
+[workspace.dependencies]
 bytemuck = {version="1.7.0",features=["derive","min_const_generics"]}
-rand = {version="0.8.5"}
-fake-enum = "0.1.2"
-lru_time_cache = "0.11.11"
 paste = "1.0.14"
-num-traits = "0.2.14"
-wgpu = {version="0.17.0", optional=true}
-winit = {version="0.28.3", optional=true}
-lccc-siphash = "0.1"
-sptr = "0.3.2"
+clever-emu-primitives = {path="clever-emu-primitives"}
+
+clever-emu-mem = {path="clever-emu-mem"}
+rand = "0.8.5"
+clever-emu-errors = {path="clever-emu-errors"}
+clever-emu-regs = {path="clever-emu-regs"}
+clever-emu-decode = {path="clever-emu-decode"}
+clever-emu-types = {path="clever-emu-types"}
+clever-emu-aci = {path="clever-emu-aci"}
+aci-firmware-hal = {git="https://github.com/Clever-ISA/aci-firmware-hal"}
+aci-registry = {version="1.1", features=["non-authorative"]}

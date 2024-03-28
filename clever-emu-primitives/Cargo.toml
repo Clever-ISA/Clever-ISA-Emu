@@ -1,0 +1,11 @@
+[package]
+name = "clever-emu-primitives"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytemuck.workspace = true
+paste.workspace = true
+
+[features]
+float = []

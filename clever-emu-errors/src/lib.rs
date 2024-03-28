@@ -1,8 +1,24 @@
-use crate::bitfield;
-use crate::cpu::ExecutionMode;
-use crate::primitive::*;
+use clever_emu_primitives::bitfield;
+
+use clever_emu_primitives::primitive::*;
+
+use clever_emu_types::CheckModeError;
+use clever_emu_types::{CheckValidError, ExecutionMode};
+
+impl From<CheckValidError> for CPUException {
+    fn from(_: CheckValidError) -> Self {
+        Self::Undefined
+    }
+}
+
+impl From<CheckModeError> for CPUException {
+    fn from(_: CheckModeError) -> Self {
+        Self::SystemProtection(LeU64::new(0))
+    }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CPUException {
     Abort,
     Undefined,
@@ -10,13 +26,15 @@ pub enum CPUException {
     PageFault(LeI64, FaultCharacteristics),
     ExecutionAlignment(LeI64),
     NonMaskableInterrupt,
+    #[cfg(feature = "float")]
     FloatingPointException(FpException),
     Reset,
 }
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::float::FpException;
+#[cfg(feature = "float")]
+use clever_emu_primitives::float::FpException;
 
 bitfield! {
     pub struct FaultStatus: LeU16{

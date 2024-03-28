@@ -1,0 +1,12 @@
+[package]
+name = "clever-emu-errors"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+float = ["clever-emu-primitives/float"]
+
+[dependencies]
+clever-emu-primitives.workspace = true
+clever-emu-types.workspace = true
+bytemuck.workspace = true
