@@ -1,6 +1,6 @@
 #![feature(cfg_target_has_atomic, strict_provenance)]
 
-use bytemuck::{AnyBitPattern, NoUninit};
+use bytemuck::{AnyBitPattern, NoUninit, Zeroable};
 
 use core::mem::{size_of, ManuallyDrop};
 
@@ -11,8 +11,17 @@ pub mod sync;
 #[cfg(feature = "float")]
 pub mod float;
 
+pub const fn const_zeroed_safe<T: Zeroable>() -> T {
+    unsafe { core::mem::zeroed() }
+}
+
 pub const fn const_transmute_safe<T: NoUninit, U: AnyBitPattern>(x: T) -> U {
-    assert!(size_of::<T>() == size_of::<U>());
+    const {
+        assert!(
+            size_of::<T>() == size_of::<U>(),
+            "cannot transmute between differently sized types"
+        );
+    }
     union Transmuter<T, U> {
         base: ManuallyDrop<T>,
         result: ManuallyDrop<U>,

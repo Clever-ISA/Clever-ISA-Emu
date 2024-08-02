@@ -142,7 +142,7 @@ microcode_group! {
 }
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, Pod, Zeroable)]
-#[repr(C, align(32))]
+#[repr(C)]
 pub struct InsnDecodeInfo {
     pub decode_ops: [DecodeUop; 8],
     pub deps_addr: BeU32,
@@ -155,8 +155,6 @@ pub struct UCodeRom<'a>(&'a [BeU32]);
 
 impl<'a> UCodeRom<'a> {
     pub fn open_rom(rom: &'a [BeU32]) -> Self {
-        assert!((rom as *const [BeU32] as *const BeU32).is_aligned_to(32));
-
         Self(rom)
     }
 

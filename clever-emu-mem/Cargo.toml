@@ -5,8 +5,9 @@ edition = "2021"
 
 [dependencies]
 clever-emu-primitives.workspace = true
+clever-emu-types.workspace = true
 rand.workspace = true
 bytemuck.workspace = true
 parking_lot = "0.12.1"
 parking_lot_core = "0.9.9"
-lru_time_cache = "0.11.11"
+lru_time_cache.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "clever-emu-storage"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aci-firmware-hal = {workspace=true, optional=true}
+aci-registry = {workspace=true, optional=true}
+clever-emu-primitives.workspace = true
+clever-emu-types.workspace = true
+clever-emu-mem = {workspace= true, optional=true}
+
+[features]
+aci = ["dep:aci-firmware-hal", "dep:aci-registry"]
+iodma = ["dep:clever-emu-mem"]
+spi = ["dep:clever-emu-mem"]
+# scsi = ["dep:clever-emu-mem"]
+ahci = []
+vhd = []

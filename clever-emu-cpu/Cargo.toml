@@ -1,17 +1,20 @@
 [package]
-name = "clever-emu-decode"
+name = "clever-emu-cpu"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 clever-emu-primitives.workspace = true
+clever-emu-mem.workspace = true
+clever-emu-errors.workspace = true
 clever-emu-regs.workspace = true
+clever-emu-decode.workspace = true
 clever-emu-types.workspace = true
 bytemuck.workspace = true
-paste.workspace = true
+lru_time_cache.workspace = true
 
 [features]
-float = ["clever-emu-primitives/float", "clever-emu-regs/float"] # X-float
+float = ["clever-emu-primitives/float", "clever-emu-errors/float", "clever-emu-regs/float", "clever-emu-decode/float"] # X-float
 vector = ["clever-emu-regs/vector"] # X-vector
 float-ext = ["float", "clever-emu-regs/float-ext"] # X-float-ext
 rand = ["clever-emu-regs/rand"] # X-rand

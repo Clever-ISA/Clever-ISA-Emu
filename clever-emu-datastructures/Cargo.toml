@@ -1,0 +1,8 @@
+[package]
+name = "clever-emu-datastructures"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+allocator-api2 = "0.2.18"
+hashbrown = {version="0.14.3", features=["raw"]}

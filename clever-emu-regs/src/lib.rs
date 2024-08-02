@@ -2,7 +2,7 @@ pub mod cpuid;
 
 use bytemuck::{Pod, Zeroable};
 
-use clever_emu_primitives::{bitfield, le_fake_enum, primitive::*};
+use clever_emu_primitives::{bitfield, bitfield::BitfieldArray, le_fake_enum, primitive::*};
 
 #[cfg(feature = "float")]
 use clever_emu_primitives::float::*;
@@ -33,6 +33,8 @@ macro_rules! safe_union{
 
         impl $union_name{
             $(
+                #[allow(dead_code)] // private fields might not be called by the method, don't lint on them
+                $(#[$meta2])*
                 $vis2 const fn $field_name(self) -> $ty{
                     const __TYCHECK: () = {
                         fn __check_impls_pod(this: $union_name) -> impl ::bytemuck::Pod{
@@ -50,6 +52,7 @@ macro_rules! safe_union{
 
 safe_union! {
     #[repr(align(16))]
+    #[cfg(feature = "vector")]
     pub union VectorPair{
         pub u128x1: LeU128,
         pub u64x2:  [LeU64;2],
@@ -67,6 +70,7 @@ safe_union! {
     }
 }
 
+#[cfg(feature = "vector")]
 impl ::core::fmt::Debug for VectorPair {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
         self.u64x2().fmt(f)
@@ -134,6 +138,8 @@ bitfield! {
         pub rpollinfo @ 10: bool,
         #[cfg(feature = "hash-accel")]
         pub haccel @ 11 : bool,
+        #[cfg(feature = "crypto")]
+        pub crypto @ 14 : bool,
     }
 }
 
@@ -159,6 +165,8 @@ impl Cr0 {
             Extension::XmRand if self.xmrand() => Ok(()),
             #[cfg(feature = "hash-accel")]
             Extension::Haccell if self.haccel() => Ok(()),
+            #[cfg(feature = "crypto")]
+            Extension::Crypto if self.crypto() => Ok(()),
             _ => Err(CPUException::Undefined),
         }
     }
@@ -232,11 +240,29 @@ impl PgTab {
     pub fn check_valid(self) -> CPUResult<()> {
         if !self.validate() {
             Err(CPUException::Undefined)
-        } else if self.ptl() > 4 {
+        } else if self.ptl() > (cpuid::CPUEX2_VAS as u8) {
             Err(CPUException::Undefined)
         } else {
             Ok(())
         }
+    }
+}
+
+bitfield! {
+    pub struct CregSize: LeU8{
+        pub size @ 0..3: LeU8,
+        pub cont @ 3: bool,
+    }
+}
+
+safe_union! {
+    #[cfg(feature = "crypto")]
+    pub union CryptoPair{
+        pub i128x1: LeU128,
+        pub i64x2: [LeU64;2],
+        pub i32x4: [LeU32; 4],
+        pub i16x8: [LeU16; 8],
+        pub i8x16: [LeU8; 16],
     }
 }
 
@@ -248,17 +274,27 @@ pub struct NamedRegs {
     pub ip: LeI64,
     pub flags: Flags,
     pub mode: Mode,
+    #[cfg(feature = "float")]
     pub fpcw: Fpcw,
+    #[cfg(not(feature = "float"))]
+    reserved19: LeU64,
     reserved20: [LeU64; 4],
     #[cfg(feature = "float")]
     pub fregs: [CleverFloatReg; 8],
     #[cfg(not(feature = "float"))]
     reserved24: [LeU64; 8],
-    reserved32: [LeU64; 32],
+    #[cfg(feature = "crypto")]
+    pub crszreg: BitfieldArray<LeU64, CregSize, 16, 4>,
+    #[cfg(not(feature = "crypto"))]
+    reserved32: LeU64,
+    reserved33: [LeU64; 31],
     #[cfg(feature = "vector")]
     pub vreg: [VectorPair; 16],
     #[cfg(not(feature = "vector"))]
     reserved64: [LeU64; 32],
+    #[cfg(feature = "crypto")]
+    pub crreg: [CryptoPair; 16],
+    #[cfg(not(feature = "crypto"))]
     reserved96: [LeU64; 32],
     pub cr0: Cr0,
     pub ptbl: PgTab,
@@ -325,7 +361,11 @@ impl Regs {
             CleverRegister(19) | CleverRegister(24..=31) => {
                 self.cr0.check_extension(Extension::Float)
             }
+            CleverRegister::crszreg | CleverRegister(96..=127) => {
+                self.cr0.check_extension(Extension::Crypto)
+            }
             CleverRegister(64..=95) => self.cr0.check_extension(Extension::Vector),
+
             CleverRegister(128..=135) | CleverRegister::pfchar | CleverRegister::fcode => {
                 mode.check_mode(CpuExecutionMode::Supervisor)?;
                 Ok(())
@@ -360,6 +400,9 @@ impl Regs {
             CleverRegister(0..=15) | CleverRegister::flags => Ok(()),
             CleverRegister::ip | CleverRegister::mode => Err(CPUException::Undefined),
             CleverRegister(24..=31) => self.cr0.check_extension(Extension::Float),
+            CleverRegister(32) | CleverRegister(96..=127) => {
+                self.cr0.check_extension(Extension::Crypto)
+            }
             CleverRegister(64..=95) => self.cr0.check_extension(Extension::Vector),
             #[cfg(feature = "float")]
             CleverRegister::fpcw => {

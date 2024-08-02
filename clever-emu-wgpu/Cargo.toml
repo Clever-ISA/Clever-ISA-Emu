@@ -1,0 +1,13 @@
+[package]
+name = "clever-emu-wgpu"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "0.20.0"
+clever-emu-aci.workspace = true
+clever-emu-primitives.workspace = true
+winit = "0.30.0"
+
+[features]
+shaders = []

@@ -488,6 +488,18 @@ macro_rules! def_fix_endian_integers{
                     Self::new(self.get().wrapping_sub(val.get()))
                 }
 
+                $vis const fn overflowing_sub(self, val: $le_int_ty) -> (Self, bool){
+                    let (val, overflow) = self.get().overflowing_sub(val.get());
+
+                    (Self::new(val), overflow)
+                }
+
+                $vis const fn overflowing_add(self, val: $le_int_ty) -> (Self, bool){
+                    let (val, overflow) = self.get().overflowing_sub(val.get());
+
+                    (Self::new(val), overflow)
+                }
+
                 $vis const fn wrapping_mul(self, val: $le_int_ty) -> Self{
                     Self::new(self.get().wrapping_mul(val.get()))
                 }

@@ -36,13 +36,14 @@ macro_rules! bitfield{
             }
 
             #[allow(unused_mut)]
+            #[inline]
             $vis fn validate(self) -> bool{
                 let mut field = <$base_ty>::new(0);
                 let mut fields_valid = true;
 
                 $($(#[$meta2])*{
                     let placement = $placement_start $(.. $placement_end)?;
-                    field |= $crate::bitfield::BitfieldPosition::insert(&placement, <$base_ty>::new(!0));
+                    field = $crate::bitfield::BitfieldPosition::insert(&placement, field, <$base_ty>::new(!0));
                     fields_valid |= $crate::bitfield::FromBitfield::<$base_ty>::validate(self. $field_name ());
                 })*
 
@@ -63,11 +64,33 @@ macro_rules! bitfield{
                     #[inline]
                     $(#[$meta2])*
                     $vis2 fn [<with_ $field_name>](val: $ty) -> Self{
+
                         let placement = $placement_start $(.. $placement_end)?;
 
                         let bits = $crate::bitfield::FromBitfield::to_bits(val);
 
-                        Self($crate::bitfield::BitfieldPosition::insert(&placement, bits))
+                        Self($crate::bitfield::BitfieldPosition::insert(&placement, $crate::const_zeroed_safe(), bits))
+                    }
+
+                    #[inline]
+                    $(#[$meta2])*
+                    $vis2 fn [<insert_ $field_name>](mut self, val: $ty) -> Self{
+                        let placement = $placement_start $(.. $placement_end)?;
+
+                        let bits = $crate::bitfield::FromBitfield::to_bits(val);
+
+                        self.0 = $crate::bitfield::BitfieldPosition::insert(&placement, self.0, bits);
+                        self
+                    }
+
+                    #[inline]
+                    $(#[$meta2])*
+                    $vis2 fn [<set_ $field_name>](&mut self, val: $ty){
+                        let placement = $placement_start $(.. $placement_end)?;
+
+                        let bits = $crate::bitfield::FromBitfield::to_bits(val);
+
+                        self.0 = $crate::bitfield::BitfieldPosition::insert(&placement, self.0, bits);
                     }
                 }
             )*
@@ -175,7 +198,10 @@ macro_rules! bitfield{
     }
 }
 
-use std::ops::Range;
+use std::{
+    marker::PhantomData,
+    ops::{BitAnd, BitOr, Not, Range, Shl},
+};
 
 pub use bitfield;
 
@@ -183,7 +209,7 @@ mod private {
     pub trait Sealed {}
 }
 
-use bytemuck::Pod;
+use bytemuck::{Pod, Zeroable};
 use private::Sealed;
 
 use crate::primitive::*;
@@ -201,7 +227,17 @@ impl Sealed for BeU128 {}
 impl Sealed for u32 {}
 impl Sealed for Range<u32> {}
 
-pub trait BitfieldTy: Sealed {}
+pub trait BitfieldTy:
+    Sealed
+    + Sized
+    + Pod
+    + BitAnd<Output = Self>
+    + BitOr<Output = Self>
+    + Not<Output = Self>
+    + Shl<u32, Output = Self>
+{
+    const ZERO: Self = crate::const_zeroed_safe();
+}
 
 impl BitfieldTy for LeU8 {}
 impl BitfieldTy for LeU16 {}
@@ -217,7 +253,7 @@ impl BitfieldTy for BeU128 {}
 
 pub trait BitfieldPosition<T: BitfieldTy>: Sealed {
     fn extract(&self, bits: T) -> T;
-    fn insert(&self, bits: T) -> T;
+    fn insert(&self, val: T, bits: T) -> T;
 }
 
 macro_rules! impl_bitfield_pos{
@@ -230,9 +266,9 @@ macro_rules! impl_bitfield_pos{
                     (bits & mask) >> (<$tys>::new(*self as _))
                 }
 
-                fn insert(&self, bits: $tys) -> $tys{
+                fn insert(&self, val: $tys, bits: $tys) -> $tys{
                     let mask = <$tys>::new(1) << (<$tys>::new(*self as _));
-                    (bits << (<$tys>::new(*self as _)))&mask
+                    ((bits << (<$tys>::new(*self as _)))&mask )| (val & !mask)
                 }
             }
             impl BitfieldPosition<$tys> for Range<u32>{
@@ -243,10 +279,10 @@ macro_rules! impl_bitfield_pos{
                     (bits & (mask << (<$tys>::new(self.start as _)))) >> (<$tys>::new(self.start as _))
                 }
 
-                fn insert(&self, bits: $tys) -> $tys{
+                fn insert(&self,val: $tys, bits: $tys) -> $tys{
                     let length = self.end-self.start;
                     let mask = (<$tys>::new(1) << (<$tys>::new(length as _) + 1)) - 1;
-                    (bits << (<$tys>::new(self.start as _)))&mask
+                    ((bits << (<$tys>::new(self.start as _)))&mask )| (val & !mask)
                 }
             }
         )*
@@ -453,7 +489,7 @@ impl<T, const N: u64> DisplayBitfield for FixedField<T, N> {
     fn present(&self) -> bool {
         false
     }
-    fn display(&self, name: &str, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    fn display(&self, _: &str, _: &mut core::fmt::Formatter) -> core::fmt::Result {
         Ok(())
     }
 }
@@ -504,3 +540,235 @@ macro_rules! impl_display_bitfield_integer {
 impl_display_bitfield_integer!(
     LeU8, LeU16, LeU32, LeU64, LeU128, BeU8, BeU16, BeU32, BeU64, BeU128
 );
+
+#[repr(transparent)]
+pub struct BitfieldArray<R, T, const N: usize, const W: u32>(R, PhantomData<[T; N]>);
+
+unsafe impl<R: Zeroable, T: Zeroable, const N: usize, const W: u32> Zeroable
+    for BitfieldArray<R, T, N, W>
+{
+}
+unsafe impl<R: Pod, T: Zeroable + Copy + 'static, const N: usize, const W: u32> Pod
+    for BitfieldArray<R, T, N, W>
+{
+}
+
+impl<R: Copy, T: Copy, const N: usize, const W: u32> Copy for BitfieldArray<R, T, N, W> {}
+impl<R: Copy, T: Copy, const N: usize, const W: u32> Clone for BitfieldArray<R, T, N, W> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<R, T, const N: usize, const W: u32> BitfieldArray<R, T, N, W> {
+    pub const fn new(val: R) -> Self {
+        assert!(core::mem::size_of::<R>() * 8 <= (N * W as usize));
+
+        Self(val, PhantomData)
+    }
+
+    pub const fn zeroed() -> Self
+    where
+        R: Zeroable,
+    {
+        Self::new(crate::const_zeroed_safe())
+    }
+}
+
+impl<R: BitfieldTy, T: FromBitfield<R>, const N: usize, const W: u32> BitfieldArray<R, T, N, W> {
+    pub fn get(&self, n: usize) -> T
+    where
+        Range<u32>: BitfieldPosition<R>,
+    {
+        if n > N {
+            panic!("index {} is out of range of array of length {}", n, N);
+        }
+
+        let bit_index = (n as u32) * W;
+
+        let bit_range = bit_index..(bit_index + W);
+
+        let bits = bit_range.extract(self.0);
+
+        T::from_bits(bits)
+    }
+    pub fn set(&mut self, n: usize, val: T)
+    where
+        Range<u32>: BitfieldPosition<R>,
+    {
+        if n > N {
+            panic!("index {} is out of range of array of length {}", n, N);
+        }
+
+        let bit_index = (n as u32) * W;
+
+        let bit_range = bit_index..(bit_index + W);
+
+        self.0 = bit_range.insert(self.0, T::to_bits(val));
+    }
+}
+
+impl<
+        B: BitfieldTy,
+        R: BitfieldTy + FromBitfield<B>,
+        T: FromBitfield<R>,
+        const N: usize,
+        const W: u32,
+    > FromBitfield<B> for BitfieldArray<R, T, N, W>
+where
+    Range<u32>: BitfieldPosition<R>,
+{
+    fn from_bits(bits: B) -> Self {
+        Self::new(R::from_bits(bits))
+    }
+    fn to_bits(self) -> B {
+        self.0.to_bits()
+    }
+
+    fn validate(self) -> bool {
+        let mut b = true;
+        for i in 0..N {
+            b &= self.get(i).validate();
+        }
+        b
+    }
+}
+
+impl<R: BitfieldTy, T: FromBitfield<R> + DisplayBitfield, const N: usize, const W: u32>
+    DisplayBitfield for BitfieldArray<R, T, N, W>
+where
+    Range<u32>: BitfieldPosition<R>,
+{
+    fn present(&self) -> bool {
+        let mut present = false;
+        for i in 0..N {
+            present |= self.get(i).present();
+        }
+        present
+    }
+
+    fn display(&self, name: &str, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        f.write_str(name)?;
+        f.write_str("[")?;
+        let mut sep = "";
+        for i in 0..N {
+            f.write_str(sep)?;
+            sep = ", ";
+            self.get(i).display("", f)?;
+        }
+        f.write_str("]")
+    }
+}
+
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+pub struct SignExt<T, const W: u32>(T);
+
+impl<T, const W: u32> SignExt<T, W> {
+    pub const fn new(val: T) -> Self {
+        Self(val)
+    }
+
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T: core::fmt::Display, const W: u32> DisplayBitfield for SignExt<T, W> {
+    fn present(&self) -> bool {
+        true
+    }
+
+    fn display(&self, name: &str, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        f.write_str(name)?;
+        f.write_str(": ")?;
+        self.0.fmt(f)
+    }
+}
+
+macro_rules! impl_sign_extend{
+    ($($signed_ty:ty : $unsigned_ty:ty),* $(,)?) => {
+        $(
+            impl<R: $crate::bitfield::BitfieldTy, const W: u32> FromBitfield<R> for SignExt<$signed_ty,W> where $unsigned_ty: FromBitfield<R>{
+                fn validate(self) -> bool{
+                    (<$signed_ty>::BITS - (self.0.leading_zeros() + self.0.leading_ones())) <= W
+                }
+
+                fn from_bits(bits: R) -> Self {
+                    const{assert!(W <= <$signed_ty>::BITS);}
+                    let unsigned_val = <$unsigned_ty>::from_bits(bits).cast_sign();
+
+                    let empty_bits = <$signed_ty>::BITS - W;
+
+                    Self::new((unsigned_val << empty_bits) >> empty_bits)
+                }
+
+                fn to_bits(self) -> R{
+                    let mask = <$unsigned_ty>::new(!0 >> (<$signed_ty>::BITS - W));
+                    let unsigned_val = self.0.cast_sign() & mask;
+
+                    unsigned_val.to_bits()
+                }
+            }
+        )*
+    };
+}
+
+impl_sign_extend! {
+    LeI8: LeU8,
+    LeI16: LeU16,
+    LeI32: LeU32,
+    LeI64: LeU64,
+    LeI128: LeU128,
+    BeI8: BeU8,
+    BeI16: BeU16,
+    BeI32: BeU32,
+    BeI64: BeU64,
+    BeI128: BeU128,
+}
+
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+pub struct Invert<T, const W: u32>(T);
+
+impl<T, const W: u32> Invert<T, W> {
+    pub const fn new(val: T) -> Self {
+        Self(val)
+    }
+
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T: DisplayBitfield, const W: u32> DisplayBitfield for Invert<T, W> {
+    fn present(&self) -> bool {
+        self.0.present()
+    }
+
+    fn display(&self, name: &str, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        self.0.display(name, f)
+    }
+}
+
+impl<R: BitfieldTy, T: FromBitfield<R>, const W: u32> FromBitfield<R> for Invert<T, W> {
+    fn validate(self) -> bool {
+        self.0.validate()
+    }
+
+    fn from_bits(bits: R) -> Self {
+        let mask = (!R::ZERO) << W;
+
+        let real_val = !(bits | mask);
+
+        Self::new(T::from_bits(real_val))
+    }
+
+    fn to_bits(self) -> R {
+        let mask = (!R::ZERO) << W;
+
+        let bits = self.0.to_bits();
+
+        let real_val = !(bits | mask);
+
+        real_val
+    }
+}

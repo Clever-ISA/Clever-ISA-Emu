@@ -1,7 +1,10 @@
 use bytemuck::{Pod, Zeroable};
 
 use core::cmp::{Eq, Ord, PartialEq, PartialOrd};
-use core::ops::{Add, BitAnd, BitOr, BitXor, Neg, Not, Shl, Shr, Sub};
+use core::ops::{
+    Add, AddAssign, BitAnd, BitOr, BitOrAssign, BitXor, Neg, Not, Shl, ShlAssign, Shr, ShrAssign,
+    Sub, SubAssign,
+};
 use std::num::FpCategory;
 
 use crate::bitfield;
@@ -26,10 +29,23 @@ le_fake_enum! {
         ToInf = 1,
         ToNInf = 2,
         ToZero = 3,
+
+        Dynamic = 7,
     }
 }
 
-#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+mod private {
+    use super::{LeU128, LeU16, LeU32, LeU64};
+
+    pub trait Sealed {}
+
+    impl Sealed for LeU16 {}
+    impl Sealed for LeU32 {}
+    impl Sealed for LeU64 {}
+    impl Sealed for LeU128 {}
+}
+
+#[derive(Copy, Clone)]
 #[repr(transparent)]
 pub struct CleverFloat<T>(T);
 
@@ -37,56 +53,211 @@ pub unsafe trait FloatRepr:
     Pod
     + BitAnd<Output = Self>
     + BitOr<Output = Self>
+    + BitOrAssign
     + BitXor<Output = Self>
     + Not<Output = Self>
     + Add<Output = Self>
+    + AddAssign
     + Sub<Output = Self>
+    + SubAssign
     + Shr<u32, Output = Self>
+    + ShrAssign<u32>
     + Shl<u32, Output = Self>
+    + ShlAssign<u32>
     + Eq
     + Ord
+    + private::Sealed
 {
+    const BITS: u32;
     const MANT_BITS: u32;
     const EXP_BITS: u32;
     const EXP_BIAS: Self;
 
     const ZERO: Self;
     const ONE: Self;
+
+    fn from_bits(bits: u32) -> Self;
+
+    fn overflowing_sub(self, other: Self) -> (Self, bool);
+
+    fn overflowing_add(self, other: Self) -> (Self, bool);
+
+    ///
+    ///
+    /// Returns `(h, l)`, where `h` is the high bits of the result, and `l` is the low bits of the result
+    fn widening_mul(self, other: Self) -> (Self, Self);
+
+    fn leading_zeros(self) -> u32;
+
+    fn to_bits(self) -> u32;
 }
 
 unsafe impl<T: Zeroable> Zeroable for CleverFloat<T> {}
 unsafe impl<T: Pod> Pod for CleverFloat<T> {}
 
 unsafe impl FloatRepr for LeU16 {
+    const BITS: u32 = Self::BITS;
     const MANT_BITS: u32 = 10;
     const EXP_BITS: u32 = 5;
     const EXP_BIAS: Self = Self::new(15);
     const ZERO: Self = Self::new(0);
     const ONE: Self = Self::new(1);
+
+    fn from_bits(bits: u32) -> Self {
+        Self::new(bits.try_into().unwrap())
+    }
+
+    fn overflowing_sub(self, other: Self) -> (Self, bool) {
+        self.overflowing_sub(other)
+    }
+
+    fn overflowing_add(self, other: Self) -> (Self, bool) {
+        self.overflowing_add(other)
+    }
+
+    fn widening_mul(self, other: Self) -> (Self, Self) {
+        let x = self.get() as u32;
+        let y = other.get() as u32;
+
+        let mul = x * y;
+
+        (Self::new((mul >> 16) as u16), Self::new(mul as u16))
+    }
+
+    fn leading_zeros(self) -> u32 {
+        self.leading_zeros()
+    }
+
+    fn to_bits(self) -> u32 {
+        self.get().into()
+    }
 }
 
 unsafe impl FloatRepr for LeU32 {
+    const BITS: u32 = Self::BITS;
     const MANT_BITS: u32 = 23;
     const EXP_BITS: u32 = 8;
     const EXP_BIAS: Self = Self::new(127);
     const ZERO: Self = Self::new(0);
     const ONE: Self = Self::new(1);
+
+    fn from_bits(bits: u32) -> Self {
+        Self::new(bits.try_into().unwrap())
+    }
+
+    fn overflowing_sub(self, other: Self) -> (Self, bool) {
+        self.overflowing_sub(other)
+    }
+
+    fn overflowing_add(self, other: Self) -> (Self, bool) {
+        self.overflowing_add(other)
+    }
+
+    fn widening_mul(self, other: Self) -> (Self, Self) {
+        let x = self.get() as u64;
+        let y = other.get() as u64;
+
+        let mul = x * y;
+
+        (Self::new((mul >> 32) as u32), Self::new(mul as u32))
+    }
+    fn leading_zeros(self) -> u32 {
+        self.leading_zeros()
+    }
+
+    fn to_bits(self) -> u32 {
+        self.get()
+    }
 }
 
 unsafe impl FloatRepr for LeU64 {
+    const BITS: u32 = Self::BITS;
     const MANT_BITS: u32 = 52;
     const EXP_BITS: u32 = 11;
     const EXP_BIAS: Self = Self::new(1023);
     const ZERO: Self = Self::new(0);
     const ONE: Self = Self::new(1);
+
+    fn from_bits(bits: u32) -> Self {
+        Self::new(bits.try_into().unwrap())
+    }
+
+    fn widening_mul(self, other: Self) -> (Self, Self) {
+        let x = self.get() as u128;
+        let y = other.get() as u128;
+
+        let mul = x * y;
+
+        (Self::new((mul >> 64) as u64), Self::new(mul as u64))
+    }
+
+    fn overflowing_sub(self, other: Self) -> (Self, bool) {
+        self.overflowing_sub(other)
+    }
+
+    fn overflowing_add(self, other: Self) -> (Self, bool) {
+        self.overflowing_add(other)
+    }
+
+    fn leading_zeros(self) -> u32 {
+        self.leading_zeros()
+    }
+    fn to_bits(self) -> u32 {
+        self.get().try_into().unwrap()
+    }
 }
 
 unsafe impl FloatRepr for LeU128 {
+    const BITS: u32 = Self::BITS;
     const MANT_BITS: u32 = 113;
     const EXP_BITS: u32 = 15;
     const EXP_BIAS: Self = Self::new(16383);
     const ZERO: Self = Self::new(0);
     const ONE: Self = Self::new(1);
+
+    fn from_bits(bits: u32) -> Self {
+        use core::convert::TryInto;
+        Self::new(bits.try_into().unwrap())
+    }
+
+    fn overflowing_sub(self, other: Self) -> (Self, bool) {
+        self.overflowing_sub(other)
+    }
+
+    fn overflowing_add(self, other: Self) -> (Self, bool) {
+        self.overflowing_add(other)
+    }
+
+    fn widening_mul(self, other: Self) -> (Self, Self) {
+        let this = self.get();
+        let other = other.get();
+
+        let this_lo = this & (!0 >> 64);
+        let this_hi = this >> 64;
+        let other_lo = other & (!0 >> 64);
+        let other_hi = other >> 64;
+
+        let res_lo = this_lo * other_lo;
+
+        let res_mid1 = this_lo * other_hi;
+        let res_mid2 = this_hi * other_lo;
+
+        let (res_mid, carry) = res_mid1.overflowing_add(res_mid2);
+
+        let res_hi = this_hi * other_hi + (carry as u128);
+
+        let (lo, carry) = res_lo.overflowing_add(res_mid << 64);
+        let hi = res_hi + (res_mid >> 64) + (carry as u128);
+
+        (LeU128::new(hi), LeU128::new(lo))
+    }
+    fn leading_zeros(self) -> u32 {
+        self.leading_zeros()
+    }
+
+    fn to_bits(self) -> u32 {
+        self.get().try_into().unwrap()
+    }
 }
 
 impl<T: Copy> CleverFloat<T> {
@@ -102,7 +273,7 @@ impl<T: Copy> CleverFloat<T> {
 impl<T: FloatRepr> CleverFloat<T> {
     pub const ZERO: Self = Self(T::ZERO);
 
-    pub const RADIX: u32 = 0;
+    pub const RADIX: u32 = 2;
     pub const MANTISSA_DIGITS: u32 = T::MANT_BITS + 1;
 
     fn exp_exponent() -> T {
@@ -149,6 +320,12 @@ impl<T: FloatRepr> CleverFloat<T> {
         let val = !anti_val;
 
         Self(val)
+    }
+
+    fn non_const_one() -> Self {
+        let exp = T::EXP_BIAS;
+
+        Self(exp << T::MANT_BITS)
     }
 
     fn from_fields(sign: bool, exp: T, mant: T) -> Self {
@@ -238,165 +415,33 @@ impl<T: FloatRepr> CleverFloat<T> {
         (this ^ sign).cmp(&(other ^ sign))
     }
 
-    pub fn add_round(self, other: Self, rnd: RoundingMode) -> FloatResult<Self> {
-        let (this_sign, mut this_exp, this_mant) = self.extract_fields();
-        let (other_sign, other_exp, other_mant) = other.extract_fields();
+    fn mul_add_impl(
+        a_mant: T,
+        b_mant: T,
+        mut c_mant: T,
+        mut prod_exp: T,
+        c_exp: T,
+        prod_sign: bool,
+        c_sign: bool,
+        rnd: RoundingMode,
+    ) -> FloatResult<Self> {
+        let (mut prod_hi, mut prod_lo) = T::widening_mul(a_mant, b_mant);
 
-        match (self.classify(), other.classify()) {
-            (FpCategory::Nan, _) => Ok(self),
-            (_, FpCategory::Nan) => Ok(other),
-            (FpCategory::Infinite, FpCategory::Infinite) | (FpCategory::Zero, FpCategory::Zero)
-                if this_sign == other_sign =>
-            {
-                Ok(self)
-            }
-            (FpCategory::Infinite, FpCategory::Infinite) => {
-                let nan = Self::non_const_nan();
-
-                Err((FpException::with_invalid(true), nan))
-            }
-            (FpCategory::Infinite, _) => Ok(self),
-            (_, FpCategory::Infinite) => Ok(other),
-            (FpCategory::Zero, FpCategory::Zero) => Ok(Self::ZERO),
-            (FpCategory::Zero, _) => Ok(other),
-            (_, FpCategory::Zero) => Ok(self),
-            (FpCategory::Subnormal, _) | (_, FpCategory::Subnormal) => {
-                todo!("Figure out subnormals")
-            }
-            (_, _) => {
-                let real_mant_mask = !T::ZERO >> (T::EXP_BITS - 1);
-                let mant_mask = real_mant_mask >> 2;
-                let this_real_mant = (this_mant | (T::ONE << T::MANT_BITS)) << 1;
-                let other_real_mant = (this_mant | (T::ONE << T::MANT_BITS)) << 1;
-                let (sign, mut exp, mut sum_mant, mut inexact) = match (
-                    this_exp == other_exp,
-                    this_sign == other_sign,
-                ) {
-                    (true, true) => (this_sign, this_exp, this_real_mant + other_real_mant, false),
-                    (false, true) => {
-                        let mut fields = [(this_exp, this_real_mant), (other_exp, other_real_mant)];
-                        fields.sort_unstable_by_key(|(exp, _)| *exp); // we know they aren't the same value so unstable sorting is fine
-                        let [(mut small_exp, mut small_mant), (large_exp, large_mant)] = fields;
-
-                        let mut inexact = false;
-
-                        while small_exp != large_exp {
-                            small_exp = small_exp + T::ONE;
-                            inexact |= (small_mant & T::ONE) == T::ONE;
-                            small_mant = small_mant >> 1;
-                        }
-
-                        (this_sign, large_exp, large_mant + small_mant, inexact)
-                    }
-                    (true, false) => {
-                        if this_real_mant == other_real_mant {
-                            return Ok(Self::ZERO);
-                        }
-
-                        let mut fields: [(bool, T); 2] =
-                            [(this_sign, this_real_mant), (other_sign, other_real_mant)];
-                        fields.sort_unstable_by_key(|(_, mant)| *mant);
-                        let [(_, small_mant), (large_sign, large_mant)] = fields;
-
-                        (large_sign, this_exp, large_mant - small_mant, false)
-                    }
-                    (false, false) => {
-                        let mut fields = [
-                            (this_sign, this_exp, this_real_mant),
-                            (other_sign, other_exp, other_real_mant),
-                        ];
-                        fields.sort_unstable_by_key(|(_, exp, _)| *exp); // we know they aren't the same value so unstable sorting is fine
-                        let [(_, mut small_exp, mut small_mant), (large_sign, large_exp, large_mant)] =
-                            fields;
-
-                        let mut inexact = false;
-
-                        while small_exp != large_exp {
-                            small_exp = small_exp + T::ONE;
-                            inexact |= (small_mant & T::ONE) == T::ONE;
-                            small_mant = small_mant >> 1;
-                        }
-
-                        (large_sign, large_exp, large_mant - small_mant, inexact)
-                    }
-                };
-
-                let unrounded = Self::from_fields(sign, exp, (sum_mant >> 1) & mant_mask);
-
-                if sum_mant == T::ZERO {
-                    if inexact {
-                        let val = match rnd {
-                            RoundingMode::ToNInf => Self(T::ONE).negate(),
-                            RoundingMode::ToInf => Self(T::ONE),
-                            RoundingMode::HalfToEven | RoundingMode::ToZero => Self::ZERO,
-                            x => panic!("Invalid rounding mode {:?}", x),
-                        };
-
-                        return Err((FpException::with_underflow(true), val));
-                    } else {
-                        return Ok(Self::ZERO.copysign(unrounded));
-                    }
-                }
-
-                if (sum_mant & !real_mant_mask) != T::ZERO {
-                    inexact |= (sum_mant & T::ONE) == T::ONE;
-                    sum_mant = sum_mant >> 1;
-                    exp = exp + T::ONE;
-                }
-
-                if exp >= Self::exp_exponent() {
-                    return Err((
-                        FpException::with_overflow(true),
-                        Self::non_const_plus_infinity().copysign(unrounded),
-                    ));
-                }
-
-                let low_bit = sum_mant & T::ONE;
-                inexact |= low_bit == T::ONE;
-                sum_mant = sum_mant >> 1;
-
-                if inexact {
-                    let inc = match rnd {
-                        RoundingMode::HalfToEven => sum_mant & low_bit & T::ONE,
-                        RoundingMode::ToInf if !this_sign => T::ZERO,
-                        RoundingMode::ToNInf if this_sign => T::ONE,
-                        RoundingMode::ToInf | RoundingMode::ToNInf | RoundingMode::ToZero => {
-                            T::ZERO
-                        }
-
-                        x => panic!("Invalid rounding mode {:?}", x),
-                    };
-
-                    sum_mant = sum_mant + inc;
-                    if (sum_mant & !(real_mant_mask >> 1)) != T::ZERO {
-                        sum_mant = sum_mant >> 1;
-                        exp = exp + T::ONE;
-                    }
-
-                    if this_exp >= Self::exp_exponent() {
-                        Err((
-                            FpException::with_overflow(true) | FpException::with_inexact(true),
-                            Self::non_const_plus_infinity().copysign(unrounded),
-                        ))
-                    } else {
-                        Err((
-                            FpException::with_inexact(true),
-                            Self::from_fields(sign, exp, sum_mant),
-                        ))
-                    }
-                } else {
-                    Ok(Self::from_fields(sign, exp, sum_mant))
-                }
-            }
-        }
+        todo!()
     }
 
-    pub fn sub_round(self, other: Self, rnd: RoundingMode) -> FloatResult<Self> {
-        if other.is_nan() {
-            return Ok(other);
-        }
+    pub fn mul_add_round(self, b: Self, c: Self, rnd: RoundingMode) -> FloatResult<Self> {
+        todo!()
+    }
 
-        self.add_round(-other, rnd)
+    pub fn add_round(self, b: Self, rnd: RoundingMode) -> FloatResult<Self> {
+        self.mul_add_round(Self::non_const_one(), b, rnd)
+    }
+}
+
+impl<T: FloatRepr> PartialEq for CleverFloat<T> {
+    fn eq(&self, other: &Self) -> bool {
+        !self.is_nan() && self.0 == other.0
     }
 }
 
@@ -449,6 +494,9 @@ macro_rules! impl_concrete_floats {
             pub const MAX: Self = Self(<$base_ty>::new((!0 >> 1) & (1 << (<$base_ty>::MANT_BITS + 1))));
             pub const MIN: Self = Self(<$base_ty>::new((!0) & (1 << (<$base_ty>::MANT_BITS + 1))));
             pub const LEAST: Self = Self(<$base_ty>::new(1));
+            pub const EPSILON: Self = Self(<$base_ty>::new(
+                ((<$base_ty>::EXP_BIAS.get() - <$base_ty>::new(<$base_ty>::MANT_BITS as _).get()) << <$base_ty>::MANT_BITS)
+            ));
 
             pub const fn to_le_bytes(self) -> [u8; core::mem::size_of::<$base_ty>()] {
                 self.into_bits().to_le_bytes()
@@ -468,14 +516,20 @@ impl_concrete_floats!(LeU16, LeU32, LeU64, LeU128);
 macro_rules! impl_from_lang_floats{
     {$($base_ty:ty => $from_float_name:ident, $to_float_name:ident : $float_ty:ty;)*} => {
         $(impl CleverFloat<$base_ty>{
-            pub fn $from_float_name(val: $float_ty) -> Self{
-                Self(<$base_ty>::new(val.to_bits()))
+            pub const fn $from_float_name(val: $float_ty) -> Self{
+                Self(<$base_ty>::new($crate::const_transmute_safe(val)))
             }
 
-            pub fn $to_float_name(self) -> $float_ty{
-                <$float_ty>::from_bits(self.0.get())
+            pub const fn $to_float_name(self) -> $float_ty{
+                $crate::const_transmute_safe(self.0.get())
             }
-        })*
+        }
+        impl core::fmt::Debug for CleverFloat<$base_ty>{
+            fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result{
+                self.$to_float_name().fmt(f)
+            }
+        }
+        )*
     }
 }
 
@@ -517,9 +571,56 @@ mod test {
     use super::{CleverF128, CleverF16, CleverF32, CleverF64};
     #[test]
     fn test_add_1_1_f32() {
+        let add_1_1 = CleverF32::from_f32(1.0) + CleverF32::from_f32(1.0);
+        let const_2 = CleverF32::from_f32(2.0);
         assert_eq!(
-            CleverF32::from_f32(1.0) + CleverF32::from_f32(1.0),
-            CleverF32::from_f32(2.0)
+            add_1_1,
+            const_2,
+            "{:?} + {:?} = {:?}",
+            CleverF32::from_f32(1.0),
+            CleverF32::from_f32(1.0),
+            add_1_1
         )
+    }
+
+    #[test]
+    fn test_add_1_half_f32() {
+        let add_1_05 = CleverF32::from_f32(1.0) + CleverF32::from_f32(0.5);
+        let const_1_5 = CleverF32::from_f32(1.5);
+        assert_eq!(
+            add_1_05,
+            const_1_5,
+            "{:?} + {:?} = {:?}",
+            CleverF32::from_f32(1.0),
+            CleverF32::from_f32(0.5),
+            add_1_05
+        )
+    }
+
+    #[test]
+    fn test_add_1_m1() {
+        let add_1_m1 = CleverF32::from_f32(1.0) + CleverF32::from_f32(-1.0);
+        let const_0 = CleverF32::from_f32(0.0);
+        assert_eq!(
+            add_1_m1,
+            const_0,
+            "{:?} + {:?} = {:?}",
+            CleverF32::from_f32(1.0),
+            CleverF32::from_f32(-1.0),
+            add_1_m1
+        )
+    }
+
+    #[test]
+    fn test_add_inf_ninf() {
+        let add_1_m1 = CleverF32::INFINITY + CleverF32::NEG_INFINITY;
+
+        assert!(
+            add_1_m1.is_nan(),
+            "{:?} + {:?} = {:?}",
+            CleverF32::INFINITY,
+            CleverF32::NEG_INFINITY,
+            add_1_m1
+        );
     }
 }

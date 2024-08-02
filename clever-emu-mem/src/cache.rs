@@ -7,9 +7,19 @@ use std::sync::Arc;
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 pub enum CacheAccessError {
+    /// Indicates that No memory is available
+    /// This is typically translated to an allocation page fault
     NoMem,
+    /// Indicates that the access to a cached memory address failed because a higher level cache reported it as locked, and the cache being used to access the memory region does not own the lock.
+    /// This is not typically reported as an error
+    ///
     Locked,
+    /// Indicates that an operation on a cached memory address required the cache line to be present, but it was not.
+    /// MMIO Devices can return this as well to indicate that it was asked to perform an operation on a memory address it does not respond to
     NotPresent,
+    /// Indicates that the operation on a cached memory address was not available, because the corresponding cache line was not in the appropriate state (typically, locked).
+    /// MMIO devices can return this as well to indicate that it was asked to perform a memory access to an address it was configured to respond to, but the operation was invalid or an error.
+    /// In the latter case, this is translated to an allocation page fault.
     Unavail,
 }
 
@@ -298,7 +308,7 @@ impl<T: CacheWrite + ?Sized> CacheWrite for &mut T {
 pub struct CacheLine([u8; 64]);
 
 impl CacheLine {
-    pub const SIZE: usize = core::mem::size_of::<Self>();
+    pub const SIZE: u64 = core::mem::size_of::<Self>() as u64;
 }
 
 #[repr(C, align(8))]

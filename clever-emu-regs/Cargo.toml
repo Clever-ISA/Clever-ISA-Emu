@@ -12,6 +12,7 @@ bytemuck.workspace = true
 [features]
 float = ["clever-emu-primitives/float", "clever-emu-errors/float"] # X-float
 vector = [] # X-vector
-float-ext = ["float"] # X-float-ext
+float-ext = [] # X-float-ext
 rand = [] # X-rand
 hash-accel = [] # X-hash-accel
+crypto = [] # X-crypto

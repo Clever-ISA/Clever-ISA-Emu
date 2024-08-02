@@ -11,6 +11,7 @@ pub enum Extension {
     XmRand = 4,
     Virt = 5,
     Haccell = 6,
+    Crypto = 7,
 }
 
 le_fake_enum! {
@@ -169,6 +170,7 @@ clever_registers! {
     f5 => 29,
     f6 => 30,
     f7 => 31,
+    crszreg => 32,
     v0l => 64,
     v0h => 65,
     v1l => 66,
@@ -201,6 +203,38 @@ clever_registers! {
     v14h => 93,
     v15l => 94,
     v15h => 95,
+    c0l => 96,
+    c0h => 97,
+    c1l => 98,
+    c1h => 99,
+    c2l => 100,
+    c2h => 101,
+    c3l => 102,
+    c3h => 103,
+    c4l => 104,
+    c4h => 105,
+    c5l => 106,
+    c5h => 107,
+    c6l => 108,
+    c6h => 109,
+    c7l => 110,
+    c7h => 111,
+    c8l => 112,
+    c8h => 113,
+    c9l => 114,
+    c9h => 115,
+    c10l => 116,
+    c10h => 117,
+    c11l => 118,
+    c11h => 119,
+    c12l => 120,
+    c12h => 121,
+    c13l => 122,
+    c13h => 123,
+    c14l => 124,
+    c14h => 125,
+    c15l => 126,
+    c15h => 127,
     cr0 => 128,
     page | cr1 => 129,
     flprotected | cr2 => 130,
@@ -279,6 +313,10 @@ impl CpuExecutionMode {
         } else {
             Ok(())
         }
+    }
+
+    pub fn into_xm(self) -> ExecutionMode {
+        ExecutionMode::from_mode(self)
     }
 }
 

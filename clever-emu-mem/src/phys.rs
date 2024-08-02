@@ -15,6 +15,10 @@ use crate::cache::{CacheAccessError, CacheFetch, CacheInvalidate, CacheLine, Cac
 #[repr(C, align(4096))]
 pub struct Page([u8; 4096]);
 
+impl Page {
+    pub const SIZE: i64 = core::mem::size_of::<Self>() as i64;
+}
+
 #[derive(Debug)]
 pub struct SysMemory {
     page_limit: u32,
@@ -86,7 +90,7 @@ impl CacheFetch for SysMemory {
 
         let lock = pg.read();
 
-        let line = &lock.0[page_offset..][..CacheLine::SIZE];
+        let line = &lock.0[page_offset..][..core::mem::size_of::<CacheLine>()];
 
         let mut output = CacheLine::zeroed();
 
@@ -133,7 +137,7 @@ impl CacheWrite for SysMemory {
 
         let mut lock = pg.write();
 
-        let line = &mut lock.0[page_offset..][..CacheLine::SIZE];
+        let line = &mut lock.0[page_offset..][..core::mem::size_of::<CacheLine>()];
 
         line.copy_from_slice(bytemuck::bytes_of(&val));
 

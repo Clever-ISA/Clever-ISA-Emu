@@ -1,18 +1,20 @@
 [workspace]
-members = [ "clever-emu-aci", "clever-emu-decode", "clever-emu-errors", "clever-emu-mem", "clever-emu-primitives", "clever-emu-regs", "clever-emu-types"]
+members = [ "clever-emu-storage", "clever-emu-aci", "clever-emu-cpu", "clever-emu-datastructures", "clever-emu-decode", "clever-emu-errors", "clever-emu-mem", "clever-emu-primitives", "clever-emu-regs", "clever-emu-types", "clever-emu-wgpu"]
 resolver = "2"
 
 [workspace.dependencies]
 bytemuck = {version="1.7.0",features=["derive","min_const_generics"]}
 paste = "1.0.14"
-clever-emu-primitives = {path="clever-emu-primitives"}
-
-clever-emu-mem = {path="clever-emu-mem"}
 rand = "0.8.5"
+lru_time_cache = "0.11.11"
+clever-emu-primitives = {path="clever-emu-primitives"}
+clever-emu-mem = {path="clever-emu-mem"}
 clever-emu-errors = {path="clever-emu-errors"}
 clever-emu-regs = {path="clever-emu-regs"}
 clever-emu-decode = {path="clever-emu-decode"}
 clever-emu-types = {path="clever-emu-types"}
 clever-emu-aci = {path="clever-emu-aci"}
+clever-emu-storage = {path="clever-emu-storage"}
+clever-emu-cpu = {path="clever-emu-cpu"}
 aci-firmware-hal = {git="https://github.com/Clever-ISA/aci-firmware-hal"}
 aci-registry = {version="1.1", features=["non-authorative"]}

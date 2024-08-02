@@ -98,6 +98,16 @@ impl<M> LocalMemoryBus<M> {
             cache: RefCell::new(Cache::new(cache_size)),
         }
     }
+
+    pub fn invalidate_local(&self, line: LeU64) {
+        let mut lock = self.cache.borrow_mut();
+        lock.invalidate_local(line);
+    }
+
+    pub fn invalidate_all_local(&self) {
+        let mut lock = self.cache.borrow_mut();
+        lock.invalidate_all_local()
+    }
 }
 
 impl<M: CacheInvalidate> CacheInvalidate for LocalMemoryBus<M> {
@@ -255,4 +265,4 @@ impl<M: CacheWrite> CacheWrite for LocalMemoryBus<M> {
 }
 
 pub type GlobalMemory = SharedMemoryBus<SysMemory>;
-pub type LocalMemory = LocalMemoryBus<GlobalMemory>;
+pub type LocalMemory = LocalMemoryBus<Arc<GlobalMemory>>;

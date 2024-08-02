@@ -7,3 +7,6 @@ edition = "2021"
 aci-registry.workspace = true
 aci-firmware-hal.workspace = true
 clever-emu-primitives.workspace = true
+clever-emu-mem.workspace = true
+clever-emu-types.workspace = true
+bytemuck.workspace = true

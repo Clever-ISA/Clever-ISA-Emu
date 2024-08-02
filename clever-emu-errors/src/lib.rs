@@ -5,6 +5,9 @@ use clever_emu_primitives::primitive::*;
 use clever_emu_types::CheckModeError;
 use clever_emu_types::{CheckValidError, ExecutionMode};
 
+#[cfg(feature = "float")]
+use clever_emu_primitives::float::FpException;
+
 impl From<CheckValidError> for CPUException {
     fn from(_: CheckValidError) -> Self {
         Self::Undefined
@@ -14,6 +17,13 @@ impl From<CheckValidError> for CPUException {
 impl From<CheckModeError> for CPUException {
     fn from(_: CheckModeError) -> Self {
         Self::SystemProtection(LeU64::new(0))
+    }
+}
+
+#[cfg(feature = "float")]
+impl From<FpException> for CPUException {
+    fn from(value: FpException) -> Self {
+        Self::FloatingPointException(value)
     }
 }
 
@@ -31,10 +41,23 @@ pub enum CPUException {
     Reset,
 }
 
-use bytemuck::{Pod, Zeroable};
+impl CPUException {
+    pub fn fault_code(&self) -> Option<LeU64> {
+        match self {
+            Self::Abort
+            | Self::Undefined
+            | Self::NonMaskableInterrupt
+            | Self::Reset
+            | Self::ExecutionAlignment(_) => None,
+            Self::SystemProtection(code) => Some(*code),
+            Self::PageFault(addr, _) => Some(addr.cast_sign()),
+            #[cfg(feature = "float")]
+            Self::FloatingPointException(fp) => Some(fp.bits().unsigned_as()),
+        }
+    }
+}
 
-#[cfg(feature = "float")]
-use clever_emu_primitives::float::FpException;
+use bytemuck::{Pod, Zeroable};
 
 bitfield! {
     pub struct FaultStatus: LeU16{
