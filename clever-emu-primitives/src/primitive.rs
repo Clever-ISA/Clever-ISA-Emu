@@ -1095,3 +1095,19 @@ def_be_le_converts! {
     BeI128 => LeI128,
     BeU128 => LeU128,
 }
+
+macro_rules! def_fixed_endian_widening_mul{
+    ($($ty:ident ($width:literal)),* $(,)?) => {
+        $(impl $ty{
+            #[doc = concat!("Computes the complete product `self * other` without overflowing, returning the high order bits.")]
+            #[doc = concat!("The result is (low, high) in that order, where the value of the product is `(high << ", ::core::stringify!($width), ") + low`, represented as an infinite range integer type")]
+            pub const fn widening_mul(self, other: Self) -> (Self, Self){
+                let (lo, hi) = self.get().widening_mul(other.get());
+
+                (Self::new(lo), Self::new(hi))
+            }
+        })*
+    }
+}
+
+def_fixed_endian_widening_mul!(LeU8(8), LeU16(16), LeU32(32), LeU64(64));

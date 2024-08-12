@@ -16,6 +16,7 @@ pub enum Extension {
 
 le_fake_enum! {
     #[repr(LeU8)]
+    #[derive(PartialOrd, Ord)]
     pub enum SizeControl{
         Byte = 0,
         Half = 1,
@@ -27,33 +28,82 @@ le_fake_enum! {
 
 impl SizeControl {
     #[inline]
-    pub fn as_bits(self) -> LeU64 {
-        LeU64::new(8) << self.0.unsigned_as::<LeU64>()
+    pub fn as_bits(self) -> u32 {
+        8 << self.0.unsigned_as::<LeU32>().get()
     }
 
     #[inline]
-    pub fn as_bytes(self) -> LeU64 {
-        LeU64::new(1) << self.0.unsigned_as::<LeU64>()
+    pub fn as_bytes(self) -> usize {
+        1 << self.0.unsigned_as::<LeU32>().get()
     }
 
     #[inline]
-    pub fn as_regwidth_mask(self) -> LeU64 {
+    pub fn as_rangeless_shift_1(self) -> LeU64 {
         LeU64::new(2) << (self.as_bits() - 1)
     }
 
     #[inline]
+    pub fn as_regwidth_mask(self) -> LeU64 {
+        self.as_rangeless_shift_1() - 1
+    }
+
+    #[inline]
     pub fn as_vectorwidth_mask(self) -> LeU128 {
-        LeU128::new(2) << (self.as_bits() - 1).unsigned_as::<LeU128>()
+        (LeU128::new(2) << (self.as_bits() - 1)) - 1
+    }
+
+    #[inline]
+    pub fn sign_extend(self, val: LeI64) -> LeI64 {
+        assert!(self.as_bits() <= 64);
+        let inv_width = 64 - self.as_bits();
+        (val << inv_width) >> inv_width
     }
 }
 
 le_fake_enum! {
     #[repr(LeU8)]
+    #[derive(PartialOrd, Ord)]
     pub enum ShiftSizeControl{
         Half = 0,
         Word = 1,
         Double = 2,
         Quad = 3,
+    }
+}
+
+impl PartialEq<SizeControl> for ShiftSizeControl {
+    fn eq(&self, other: &SizeControl) -> bool {
+        match (*self, *other) {
+            (ShiftSizeControl::Half, SizeControl::Half)
+            | (ShiftSizeControl::Word, SizeControl::Word)
+            | (ShiftSizeControl::Double, SizeControl::Double)
+            | (ShiftSizeControl::Quad, SizeControl::Quad) => true,
+            _ => false,
+        }
+    }
+}
+
+impl PartialEq<ShiftSizeControl> for SizeControl {
+    fn eq(&self, other: &ShiftSizeControl) -> bool {
+        match (*other, *self) {
+            (ShiftSizeControl::Half, SizeControl::Half)
+            | (ShiftSizeControl::Word, SizeControl::Word)
+            | (ShiftSizeControl::Double, SizeControl::Double)
+            | (ShiftSizeControl::Quad, SizeControl::Quad) => true,
+            _ => false,
+        }
+    }
+}
+
+impl PartialOrd<SizeControl> for ShiftSizeControl {
+    fn partial_cmp(&self, other: &SizeControl) -> Option<std::cmp::Ordering> {
+        self.as_size_control().partial_cmp(other)
+    }
+}
+
+impl PartialOrd<ShiftSizeControl> for SizeControl {
+    fn partial_cmp(&self, other: &ShiftSizeControl) -> Option<std::cmp::Ordering> {
+        self.partial_cmp(&other.as_size_control())
     }
 }
 
@@ -69,8 +119,8 @@ impl ShiftSizeControl {
     }
 
     #[inline]
-    pub fn as_bytes(self) -> LeU64 {
-        LeU64::new(2) << self.0.unsigned_as::<LeU64>()
+    pub fn as_bytes(self) -> usize {
+        1 << self.0.unsigned_as::<LeU32>().get()
     }
 
     #[inline]
@@ -81,6 +131,14 @@ impl ShiftSizeControl {
     #[inline]
     pub fn as_vectorwidth_mask(self) -> LeU128 {
         LeU128::new(2) << (self.as_bits() - 1).unsigned_as::<LeU128>()
+    }
+
+    #[inline]
+    pub fn sign_extend(self, val: LeI64) -> LeI64 {
+        assert!(self.as_bits() <= 64);
+        let inv_width = 64 - self.as_bits().get() as u32;
+
+        ((val << inv_width) >> inv_width)
     }
 }
 

@@ -1,25 +1,26 @@
 use bytemuck::{AnyBitPattern, NoUninit, Zeroable};
-use clever_emu_decode::op::Operand;
+use clever_emu_decode::{
+    decode::{FromInstructionStream, InstructionStream},
+    instr::{Instruction, Operand},
+};
 use clever_emu_errors::{AccessKind, CPUException, CPUResult, FaultCharacteristics, FaultStatus};
-use clever_emu_regs::Regs;
-use clever_emu_types::CpuExecutionMode;
+use clever_emu_regs::{Flags, Regs};
+use clever_emu_types::{
+    CleverRegister, CpuExecutionMode, Extension, ShiftSizeControl, SizeControl,
+};
 
-use crate::mem::{AddrResolver, DataCache, InstrCache, L2Cache};
+use crate::mem::{AddrResolver, DataCache, DataCacheLockGuard, InstrCache, L2Cache};
 use clever_emu_mem::{
-    bus::{GlobalMemory, LocalMemory},
+    bus::{GlobalMemory, LocalMemory, LocalMemoryLockGuard},
     cache::CacheLine,
     io::IoBus,
     phys::Page,
 };
 
+use core::borrow::Borrow;
 use std::{cell::Cell, sync::Arc};
 
 use clever_emu_primitives::primitive::*;
-
-pub struct CpuOperand{
-    pub cs: Operand,
-    pub imm_val: LeU128,
-}
 
 pub struct Cpu {
     regs: Regs,
@@ -60,6 +61,60 @@ pub const CPUID: [LeU64; 2] = [
     LeU64::new(0xa60f2a0ff03effe8),
     LeU64::new(0x018de1480a637e5d),
 ];
+
+fn logical_flags(res_val: LeU64, ss: SizeControl) -> Flags {
+    let mut flags = Flags::empty();
+
+    flags.set_zero(res_val == LeU64::new(0));
+
+    flags.set_negative((res_val & 1u64 << (ss.as_bits() - 1)) == 1);
+
+    flags.set_parity((res_val.count_ones() & 1) != 0);
+
+    flags
+}
+
+pub fn compute_logical<F: Fn(LeU64, LeU64) -> LeU64>(
+    f: F,
+    val1: LeU64,
+    val2: LeU64,
+    ss: SizeControl,
+) -> (LeU64, Flags) {
+    let res_val = f(val1, val2) & ss.as_regwidth_mask();
+
+    (res_val, logical_flags(res_val, ss))
+}
+
+pub fn compute_arithmetic<F: Fn(LeU64, LeU64) -> (LeU64, bool)>(
+    f: F,
+    val1: LeU64,
+    val2: LeU64,
+    ss: SizeControl,
+) -> (LeU64, Flags) {
+    let (res_val, full_carry) = f(val1, val2);
+
+    let carry =
+        (full_carry & (ss == SizeControl::Double)) | ((res_val & ss.as_rangeless_shift_1()) != 0);
+
+    let sign_bit = LeU64::new(1) << (ss.as_bits() - 1);
+    let overflow = ((val1 ^ val2 ^ res_val) & sign_bit).get() != carry as u64;
+
+    let res = res_val & ss.as_regwidth_mask();
+
+    let flags = logical_flags(res, ss)
+        .insert_carry(carry)
+        .insert_overflow(overflow);
+
+    (res, flags)
+}
+
+pub struct Stream<'a>(&'a Cpu);
+
+impl<'a> InstructionStream for Stream<'a> {
+    fn next_iword(&mut self) -> CPUResult<BeU16> {
+        self.0.fetch_iword()
+    }
+}
 
 impl Cpu {
     pub fn new(l3cache: Arc<GlobalMemory>, iobus: Arc<IoBus>, memory_sizes: CpuMemorySizes) -> Cpu {
@@ -369,6 +424,10 @@ impl Cpu {
         }
     }
 
+    pub fn as_instruction_stream(&self) -> Stream {
+        Stream(self)
+    }
+
     fn fetch_iword(&self) -> CPUResult<BeU16> {
         let next_iword_addr = self.fetch_ip.get() + 2;
         self.fetch_ip.set(next_iword_addr);
@@ -406,5 +465,582 @@ impl Cpu {
             }
         }
         Ok(iword)
+    }
+
+    fn is_simple(opr: &Operand) -> bool {
+        match opr {
+            Operand::Register(reg) => reg.reg().get() < 16,
+            Operand::SmallImm(_) => true,
+            Operand::LargeImm(cs, _) => !cs.mem(),
+            _ => false,
+        }
+    }
+
+    pub fn check_simple<I: IntoIterator>(&self, it: I) -> CPUResult<()>
+    where
+        I::Item: Borrow<Operand>,
+    {
+        if it
+            .into_iter()
+            .filter(|op| Self::is_simple(op.borrow()))
+            .count()
+            < 1
+        {
+            Ok(())
+        } else {
+            Err(CPUException::Undefined)
+        }
+    }
+
+    pub fn check_wf(&self, op: &Operand) -> CPUResult<()> {
+        match op {
+            Operand::Register(reg) => {
+                self.regs.validate_wf(reg.reg())?;
+                #[cfg(feature = "vector")]
+                {
+                    if reg.vec() {
+                        self.regs.cr0.check_extension(Extension::Vector)?;
+
+                        if (reg.reg().0 & 1) != 0 || !matches!(reg.reg(), CleverRegister(64..=127))
+                        {
+                            Err(CPUException::Undefined)
+                        } else {
+                            Ok(())
+                        }
+                    } else if reg.ss() == SizeControl::Quad {
+                        Err(CPUException::Undefined)
+                    } else {
+                        Ok(())
+                    }
+                }
+                #[cfg(not(feature = "vector"))]
+                {
+                    if reg.ss() == SizeControl::Quad {
+                        Err(CPUException::Undefined)
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+            Operand::Indirect(indr) => {
+                if indr.ss() == SizeControl::Quad {
+                    self.regs.cr0.check_extension(Extension::Vector)
+                } else {
+                    Ok(())
+                }
+            }
+            Operand::LargeImm(cs, _) => {
+                if !cs.disp() && cs.index() != CleverRegister(0) {
+                    Err(CPUException::Undefined)
+                } else if (cs.mem() || cs.rel()) && cs.ss() == ShiftSizeControl::Quad {
+                    Err(CPUException::Undefined)
+                } else if !cs.mem() && cs.zz() != SizeControl::Byte {
+                    Err(CPUException::Undefined)
+                } else if cs.ss() == ShiftSizeControl::Quad || cs.zz() == SizeControl::Quad {
+                    self.regs.cr0.check_extension(Extension::Vector)
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub fn check_scalar(&self, op: &Operand) -> CPUResult<()> {
+        match op {
+            Operand::Register(reg) => {
+                #[cfg(feature = "vector")]
+                {
+                    if reg.vec() {
+                        Err(CPUException::Undefined)
+                    } else {
+                        Ok(())
+                    }
+                }
+                #[cfg(not(feature = "vector"))]
+                {
+                    Ok(())
+                }
+            }
+            Operand::LargeImm(cs, _) => {
+                if cs.ss() == ShiftSizeControl::Quad || cs.zz() == SizeControl::Quad {
+                    Err(CPUException::Undefined)
+                } else {
+                    Ok(())
+                }
+            }
+            Operand::Indirect(indr) => {
+                if indr.ss() == SizeControl::Quad {
+                    Err(CPUException::Undefined)
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub fn check_scalar_or_vreg(&self, op: &Operand) -> CPUResult<()> {
+        match op {
+            Operand::LargeImm(cs, _) => {
+                if cs.ss() == ShiftSizeControl::Quad || cs.zz() == SizeControl::Quad {
+                    Err(CPUException::Undefined)
+                } else {
+                    Ok(())
+                }
+            }
+            Operand::Indirect(indr) => {
+                if indr.ss() == SizeControl::Quad {
+                    Err(CPUException::Undefined)
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub fn check_int(&self, op: &Operand) -> CPUResult<()> {
+        match op {
+            Operand::Register(reg) => match reg.reg() {
+                CleverRegister(0..=15) | CleverRegister(64..=127) => Ok(()),
+                _ => Err(CPUException::Undefined),
+            },
+            _ => Ok(()),
+        }
+    }
+
+    pub fn check_writable(&self, op: &Operand) -> CPUResult<()> {
+        match op {
+            Operand::Register(_) | Operand::Indirect(_) => Ok(()),
+            Operand::LargeImm(cs, _) if cs.mem() => Ok(()),
+            _ => Err(CPUException::Undefined),
+        }
+    }
+
+    pub fn validate_write(&self, op: &Operand, val: LeU64) -> CPUResult<()> {
+        let size = self.op_size(op);
+        let val = val & size.as_regwidth_mask();
+        match op {
+            Operand::Register(reg) => {
+                self.regs
+                    .validate_before_writing(reg.reg(), val, self.current_mode())
+            }
+            Operand::Indirect(_) | Operand::LargeImm(_, _) => {
+                let addr = self.compute_addr(op).ok_or(CPUException::Undefined)??;
+
+                let end_addr = addr + size.as_bytes() as i64;
+
+                self.addr_resolver
+                    .resolve_vaddr(addr, AccessKind::Write, self.current_mode())?;
+                self.addr_resolver.resolve_vaddr(
+                    end_addr,
+                    AccessKind::Write,
+                    self.current_mode(),
+                )?;
+
+                Ok(())
+            }
+            _ => Err(CPUException::Undefined),
+        }
+    }
+
+    pub fn op_size(&self, op: &Operand) -> SizeControl {
+        match op {
+            Operand::Register(reg) => reg.ss(),
+            Operand::Indirect(indr) => indr.ss(),
+            Operand::SmallImm(imm) => {
+                if imm.rel() {
+                    SizeControl::Double
+                } else {
+                    SizeControl::Half
+                }
+            }
+            Operand::LargeImm(cs, _) => {
+                if cs.mem() {
+                    cs.zz()
+                } else if cs.rel() {
+                    SizeControl::Double
+                } else {
+                    cs.ss().as_size_control()
+                }
+            }
+        }
+    }
+
+    pub fn read_op(&self, op: &Operand) -> CPUResult<LeU64> {
+        let size = self.op_size(op);
+
+        if size == SizeControl::Quad {
+            return Err(CPUException::Undefined);
+        }
+
+        if let Some(addr) = self.compute_addr(op) {
+            let addr = addr?;
+
+            let mut bytes = LeU64::new(0);
+
+            self.read_bytes(
+                addr,
+                &mut bytemuck::bytes_of_mut(&mut bytes)[..size.as_bytes()],
+            )?;
+
+            Ok(bytes)
+        } else {
+            match op {
+                Operand::Register(reg) => {
+                    self.regs
+                        .validate_before_reading(reg.reg(), self.current_mode())?;
+
+                    Ok(self.regs[reg.reg()] & size.as_regwidth_mask())
+                }
+                Operand::SmallImm(imm) => {
+                    let val = imm.imm().unsigned_as::<LeU64>();
+                    if imm.rel() {
+                        let val = val.cast_sign();
+
+                        let val = (val << 52) >> 52;
+
+                        Ok(val.wrapping_add(self.regs.ip).cast_sign())
+                    } else {
+                        Ok(val)
+                    }
+                }
+                Operand::LargeImm(cs, wide) => {
+                    let val = wide.0.unsigned_as::<LeU64>();
+
+                    if cs.rel() {
+                        let val = val.cast_sign();
+
+                        Ok(cs
+                            .ss()
+                            .sign_extend(val)
+                            .wrapping_add(self.regs.ip)
+                            .cast_sign())
+                    } else {
+                        Ok(val & cs.ss().as_regwidth_mask())
+                    }
+                }
+                Operand::Indirect(_) => unreachable!("indirect should have an address"),
+            }
+        }
+    }
+
+    pub fn write_op(&mut self, op: &Operand, val: LeU64) -> CPUResult<()> {
+        let size = self.op_size(op);
+
+        if size == SizeControl::Quad {
+            return Err(CPUException::Undefined);
+        }
+
+        if let Some(addr) = self.compute_addr(op) {
+            let addr = addr?;
+
+            self.write_bytes(addr, &bytemuck::bytes_of(&val)[..size.as_bytes()])?;
+
+            Ok(())
+        } else {
+            if let Operand::Register(reg) = op {
+                self.regs
+                    .validate_before_writing(reg.reg(), val, self.current_mode())?;
+                self.regs[reg.reg()] = val & size.as_regwidth_mask();
+                Ok(())
+            } else {
+                Err(CPUException::Undefined)
+            }
+        }
+    }
+
+    pub fn perform_rmw(
+        &mut self,
+        dest: &Operand,
+        mut op: impl FnMut(LeU64, &Cpu) -> CPUResult<LeU64>,
+        under_lock: bool,
+    ) -> CPUResult<()> {
+        let op_size = self.op_size(dest);
+        let _guard = if under_lock {
+            if let Some(vaddr) = self.compute_addr(dest) {
+                let vaddr = vaddr?;
+                let end_vaddr = vaddr + (op_size.as_bytes() as i64 - 1);
+
+                let start_paddr = self.addr_resolver.resolve_vaddr(
+                    vaddr,
+                    AccessKind::Access,
+                    self.current_mode(),
+                )?;
+                let end_paddr = self.addr_resolver.resolve_vaddr(
+                    end_vaddr,
+                    AccessKind::Access,
+                    self.current_mode(),
+                )?;
+
+                if (start_paddr & !(CacheLine::SIZE - 1)) != (end_paddr & !(CacheLine::SIZE - 1)) {
+                    Some((
+                        self.l1dcache.lock(start_paddr).map_err(|_| {
+                            CPUException::PageFault(
+                                vaddr,
+                                FaultCharacteristics {
+                                    pref: start_paddr,
+                                    access_kind: AccessKind::Allocate,
+                                    status: FaultStatus::with_non_paged(true),
+                                    ..Zeroable::zeroed()
+                                },
+                            )
+                        })?,
+                        Some(self.l1dcache.lock(end_paddr).map_err(|_| {
+                            CPUException::PageFault(
+                                vaddr,
+                                FaultCharacteristics {
+                                    pref: end_paddr,
+                                    access_kind: AccessKind::Allocate,
+                                    status: FaultStatus::with_non_paged(true),
+                                    ..Zeroable::zeroed()
+                                },
+                            )
+                        })?),
+                    ))
+                } else {
+                    Some((
+                        self.l1dcache.lock(start_paddr).map_err(|_| {
+                            CPUException::PageFault(
+                                vaddr,
+                                FaultCharacteristics {
+                                    pref: start_paddr,
+                                    access_kind: AccessKind::Allocate,
+                                    status: FaultStatus::with_non_paged(true),
+                                    ..Zeroable::zeroed()
+                                },
+                            )
+                        })?,
+                        None,
+                    ))
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let val = self.read_op(dest)?;
+
+        let res = op(val, self)?;
+
+        if let Some(addr) = self.compute_addr(dest) {
+            let addr = addr?;
+
+            self.write_bytes(addr, &bytemuck::bytes_of(&val)[..op_size.as_bytes()])?;
+            Ok(())
+        } else {
+            if let Operand::Register(reg) = dest {
+                self.regs[reg.reg()] = val & op_size.as_regwidth_mask();
+                Ok(())
+            } else {
+                return Err(CPUException::Undefined);
+            }
+        }
+    }
+
+    fn compute_addr(&self, op: &Operand) -> Option<CPUResult<LeI64>> {
+        match op {
+            Operand::Indirect(indr) => {
+                let base = indr.base();
+                let index = indr.index();
+                let scale = indr.scale();
+
+                let base_val = self.regs[base].cast_sign();
+                let index_val = self.regs[index].cast_sign();
+                let scale = LeI64::new(1) << (scale.get() as u32);
+
+                Some(Ok(index_val.wrapping_mul(scale).wrapping_add(base_val)))
+            }
+            Operand::LargeImm(cs, val) => {
+                let mut val = val.0.unsigned_as::<LeI64>();
+
+                if cs.mem() {
+                    if cs.disp() {
+                        val += self.regs[cs.index()].cast_sign();
+                    }
+
+                    if cs.rel() {
+                        val = cs.ss().sign_extend(val).wrapping_add(self.regs.ip);
+                    }
+
+                    if cs.ss() == ShiftSizeControl::Quad {
+                        Some(Err(CPUException::Undefined))
+                    } else {
+                        Some(Ok(val))
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub fn tick(&mut self) -> CPUResult<()> {
+        match self.as_instruction_stream().fetch::<Instruction>()? {
+            Instruction::Und(_) | Instruction::UndFFF(_) => Err(CPUException::Undefined),
+            Instruction::Add(h, dest, src) => {
+                self.check_wf(&dest)?;
+                self.check_wf(&src)?;
+                self.check_writable(&dest)?;
+                self.check_int(&dest)?;
+                self.check_int(&src)?;
+                self.check_simple([&dest, &src])?;
+
+                let mut flags = Flags::empty();
+
+                self.perform_rmw(
+                    &dest,
+                    |src1, cpu| {
+                        let intermediate_size = cpu.op_size(&dest).max(cpu.op_size(&src));
+                        let src2 = cpu.read_op(&src)?;
+
+                        let res;
+                        (res, flags) = compute_arithmetic(
+                            LeU64::overflowing_add,
+                            src1,
+                            src2,
+                            intermediate_size,
+                        );
+
+                        Ok(res)
+                    },
+                    h.lock(),
+                )?;
+
+                if !h.supress_flags() {
+                    self.regs.flags = flags;
+                }
+                Ok(())
+            }
+            Instruction::Sub(h, dest, src) => {
+                self.check_wf(&dest)?;
+                self.check_wf(&src)?;
+                self.check_writable(&dest)?;
+                self.check_int(&dest)?;
+                self.check_int(&src)?;
+                self.check_simple([&dest, &src])?;
+
+                let mut flags = Flags::empty();
+
+                self.perform_rmw(
+                    &dest,
+                    |src1, cpu| {
+                        let intermediate_size = cpu.op_size(&dest).max(cpu.op_size(&src));
+                        let src2 = (!cpu.read_op(&src)?).wrapping_add(LeU64::new(1));
+
+                        let res;
+                        (res, flags) = compute_arithmetic(
+                            LeU64::overflowing_add,
+                            src1,
+                            src2,
+                            intermediate_size,
+                        );
+
+                        Ok(res)
+                    },
+                    h.lock(),
+                )?;
+
+                if !h.supress_flags() {
+                    self.regs.flags = flags;
+                }
+                Ok(())
+            }
+            Instruction::And(h, dest, src) => {
+                self.check_wf(&dest)?;
+                self.check_wf(&src)?;
+                self.check_writable(&dest)?;
+                self.check_int(&dest)?;
+                self.check_int(&src)?;
+                self.check_simple([&dest, &src])?;
+
+                let mut flags = Flags::empty();
+
+                self.perform_rmw(
+                    &dest,
+                    |src1, cpu| {
+                        let intermediate_size = cpu.op_size(&dest).max(cpu.op_size(&src));
+                        let src2 = (!cpu.read_op(&src)?).wrapping_add(LeU64::new(1));
+
+                        let res = src1 & src2;
+
+                        flags = logical_flags(res, intermediate_size);
+
+                        Ok(res)
+                    },
+                    h.lock(),
+                )?;
+
+                if !h.supress_flags() {
+                    self.regs.flags.set_logical(flags);
+                }
+                Ok(())
+            }
+            Instruction::Or(h, dest, src) => {
+                self.check_wf(&dest)?;
+                self.check_wf(&src)?;
+                self.check_writable(&dest)?;
+                self.check_int(&dest)?;
+                self.check_int(&src)?;
+                self.check_simple([&dest, &src])?;
+
+                let mut flags = Flags::empty();
+
+                self.perform_rmw(
+                    &dest,
+                    |src1, cpu| {
+                        let intermediate_size = cpu.op_size(&dest).max(cpu.op_size(&src));
+                        let src2 = (!cpu.read_op(&src)?).wrapping_add(LeU64::new(1));
+
+                        let res = src1 | src2;
+
+                        flags = logical_flags(res, intermediate_size);
+
+                        Ok(res)
+                    },
+                    h.lock(),
+                )?;
+
+                if !h.supress_flags() {
+                    self.regs.flags.set_logical(flags);
+                }
+                Ok(())
+            }
+            Instruction::Xor(h, dest, src) => {
+                self.check_wf(&dest)?;
+                self.check_wf(&src)?;
+                self.check_writable(&dest)?;
+                self.check_int(&dest)?;
+                self.check_int(&src)?;
+                self.check_simple([&dest, &src])?;
+
+                let mut flags = Flags::empty();
+
+                self.perform_rmw(
+                    &dest,
+                    |src1, cpu| {
+                        let intermediate_size = cpu.op_size(&dest).max(cpu.op_size(&src));
+                        let src2 = (!cpu.read_op(&src)?).wrapping_add(LeU64::new(1));
+
+                        let res = src1 ^ src2;
+
+                        flags = logical_flags(res, intermediate_size);
+
+                        Ok(res)
+                    },
+                    h.lock(),
+                )?;
+
+                if !h.supress_flags() {
+                    self.regs.flags.set_logical(flags);
+                }
+                Ok(())
+            }
+            _ => Err(CPUException::Undefined),
+        }
     }
 }

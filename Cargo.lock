@@ -305,6 +305,7 @@ name = "clever-emu-decode"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "clever-emu-errors",
  "clever-emu-primitives",
  "clever-emu-regs",
  "clever-emu-types",

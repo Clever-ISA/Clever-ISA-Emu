@@ -1,3 +1,4 @@
+use clever_emu_errors::{CPUException, CPUResult};
 use clever_emu_primitives::{bitfield, bitfield::*, le_fake_enum, primitive::*};
 use clever_emu_regs::*;
 use clever_emu_types::{CleverRegister, ShiftSizeControl, SizeControl};
@@ -6,131 +7,11 @@ use paste::paste;
 #[cfg(feature = "float")]
 use clever_emu_primitives::float::RoundingMode;
 
-macro_rules! def_enum{
-    {
-        #[repr($base_ty:ident)]
-        $(#[$outer_meta:meta])*
-        $vis:vis enum $gname:ident @ $(#[$opcode_meta:meta])* $opcstart:literal .. $opcend:literal {
-            $(#![$enum_meta:meta])*
-            $($(#[$meta:meta])* $uop:ident {$($decode_bits:tt)*} = $uopc:literal),* $(,)?
-        }
-    } => {
-        paste!{
-            $(#[$outer_meta])*
-            $vis mod [<$gname:snake _bits>]{
-                use super::*;
-                $(::clever_emu_primitives::bitfield::bitfield!{
-                    $(#[$meta])*
-                    pub struct $uop : $base_ty{
-                        $($decode_bits)*
-                    }
-                })*
-            }
-
-            bitfield!{
-                $(#[$outer_meta])*
-                $vis struct [<$gname Encoded>]: $base_ty{
-                    $vis decodebits @ 0..$opcstart : $base_ty,
-                    $(#[$opcode_meta])*
-                    $vis discrim @ $opcstart .. $opcend : $base_ty,
-                }
-            }
-
-            #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
-            $(#[$outer_meta])*
-            $(#[$enum_meta])*
-            $vis enum $gname{
-                $($(#[$meta])* $uop ([<$gname:snake _bits>]::$uop),)*
-
-                #[doc(hidden)]
-                __Invalid([<$gname Encoded>])
-            }
-
-            $(#[$outer_meta])*
-            impl $gname{
-                $vis fn encode(self) -> [<$gname Encoded>]{
-                    match self{
-                        $($(#[$meta])* Self:: $uop(payload) => [<$gname Encoded>]::with_discrim(<$base_ty>::new($uopc)).insert_decodebits(payload.to_bits()),)*
-                        Self::__Invalid(payload) => payload,
-                    }
-                }
-
-            }
-
-            $(#[$outer_meta])*
-            impl<R: ::clever_emu_primitives::bitfield::BitfieldTy> ::clever_emu_primitives::bitfield::FromBitfield<R> for $gname where [<$gname Encoded>]: ::clever_emu_primitives::bitfield::FromBitfield<R>{
-                fn validate(self) -> bool{
-                    match self{
-                        $($(#[$meta])* Self:: $uop(payload) => payload.validate(),)*
-                        Self::__Invalid(_) => false
-                    }
-                }
-
-                fn from_bits(bits: R) -> Self{
-                    <[<$gname Encoded>] as ::clever_emu_primitives::bitfield::FromBitfield::<R>>::from_bits(bits).decode()
-                }
-
-                fn to_bits(self) -> R{
-                    <[<$gname Encoded>] as ::clever_emu_primitives::bitfield::FromBitfield::<R>>::to_bits(self.encode())
-                }
-            }
-
-
-            $(#[$outer_meta])*
-            impl ::clever_emu_primitives::bitfield::DisplayBitfield for $gname{
-                fn present(&self) -> bool{
-                    true
-                }
-
-                fn display(&self, name: &str, f: &mut core::fmt::Formatter) -> core::fmt::Result{
-                    f.write_str(name)?;
-                    f.write_str(": ")?;
-                    ::core::fmt::Display::fmt(self, f)
-                }
-            }
-
-            $(#[$outer_meta])*
-            impl ::core::fmt::Display for $gname{
-                fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result{
-                    match self{
-                        $(Self:: $uop (payload) => {
-                            f.write_str(::core::stringify!($uop))?;
-                            payload.fmt(f)
-                        },)*
-                        Self::__Invalid(payload) => {
-                            f.write_fmt(format_args!("**invalid {}: {:#x}**", ::core::stringify!([<$gname:snake>]), payload.bits()))
-                        }
-                    }
-                }
-            }
-
-
-            $(#[$outer_meta])*
-            impl [<$gname Encoded>]{
-                $vis fn decode(self) -> $gname{
-                    match self.discrim().get(){
-                        $($(#[$meta])* $uopc => $gname :: $uop ( [<$gname:snake _bits>]::$uop::from_bits(self.decodebits())),)*
-                        __inval => $gname::__Invalid(self)
-                    }
-                }
-            }
-        }
-    }
-}
+use crate::decode::{AsDecodeContext, FromInstructionStream, NoContext};
 
 def_enum! {
     #[repr(BeU16)]
     pub enum InvalidEncoding @ 0..16{}
-}
-
-def_enum! {
-    #[repr(BeU16)]
-    pub enum Operand @ 14..16{
-        Register { #[cfg(feature = "vector")] vec @ 13 : bool, ss @ 8..11: SizeControl, reg @ 0..8: CleverRegister} = 0,
-        Indirect {off @ 9..13: CleverRegister, scale @ 7..9: LeU8, ss @ 4..7: SizeControl, base @ 0..8: CleverRegister} = 1,
-        ImmShort {rel @ 12: bool, imm @ 0..12: LeU16} = 2,
-        ImmLong { mem @ 13: bool, rel @ 10: bool, immss @ 8..10: ShiftSizeControl, memss @ 4..6: SizeControl, dispreg @ 0..4: CleverRegister} = 3,
-    }
 }
 
 le_fake_enum! {
@@ -182,7 +63,7 @@ def_enum! {
         PopGpr {} = 0o0036,
         PopAr {} = 0o0037,
 
-        MosSx {supress_flags @ 0: bool} = 0o0040,
+        MovSx {supress_flags @ 0: bool} = 0o0040,
         Bswap {supress_flags @ 0: bool} = 0o0041,
         #[cfg(feature = "float")]
         MovIf {unsigned @ 1: bool, supress_flags @ 0: bool} = 0o0042,
@@ -383,6 +264,14 @@ bitfield! {
     }
 }
 
+impl AsDecodeContext for CondBranch {
+    type Context = ShiftSizeControl;
+
+    fn as_context(&self) -> Self::Context {
+        self.ss()
+    }
+}
+
 bitfield! {
     pub struct UncondBranch : BeU16{
         pub rel @ 8: bool,
@@ -390,21 +279,29 @@ bitfield! {
     }
 }
 
+impl AsDecodeContext for UncondBranch {
+    type Context = UncondBranchOpcode;
+
+    fn as_context(&self) -> UncondBranchOpcode {
+        self.opcode()
+    }
+}
+
 def_enum! {
     #[repr(BeU8)]
     pub enum UncondBranchOpcode @ 4..8{
         #![non_exhaustive]
-        Jmp{ss @ 0..2: ShiftSizeControl} = 0,
-        Call{ss @ 0..2: ShiftSizeControl} = 1,
-        Fcall{ss @ 0..2: ShiftSizeControl} = 2,
+        Jmp{ss @ 0..2: ShiftSizeControl} context ss: ShiftSizeControl = 0,
+        Call{ss @ 0..2: ShiftSizeControl} context ss: ShiftSizeControl = 1,
+        Fcall{ss @ 0..2: ShiftSizeControl}  context ss: ShiftSizeControl = 2,
         Ret{} = 3,
         Scall{} = 4,
         Int{int @ 0..4: LeU8} = 5,
         Ijmp{reg @ 0..4: CleverRegister} = 6,
         Icall{reg @ 0..4: CleverRegister} = 7,
         Ifcall{} = 8,
-        JmpSM{} = 9,
-        CallSM{save @ 0: bool} = 10,
+        JmpSM{ss @ 0..2: ShiftSizeControl}  context ss: ShiftSizeControl = 9,
+        CallSM{save @ 3: bool, ss @ 0..2: ShiftSizeControl}  context ss: ShiftSizeControl = 10,
         RetRsm{} = 11,
     }
 }
@@ -425,113 +322,25 @@ bitfield! {
     }
 }
 
-macro_rules! capturing_enum{
-    {
-        #[repr($base_ty:ident)]
-        $(#[$outer_meta:meta])*
-        $vis:vis enum $gname:ident @ $(#[$opcode_meta:meta])* $opcstart:literal .. $opcend:literal {
-            $(#![$enum_meta:meta])*
-            $($uop:ident ($field:ty) = $uopc:literal,)*
-            #[default] $last_uop:ident ($last_field:ty)
-            $(,)?
-        }
-    } => {
-
-        paste!{
-            $(#[$outer_meta])*
-            $(#[$enum_meta])*
-            #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
-            $vis enum $gname{
-                $($uop($field),)*
-                $last_uop($last_field),
-            }
-            bitfield!{
-                $(#[$outer_meta])*
-                $vis struct [<$gname Encoded>]: $base_ty{
-                    $vis decodebits @ 0..$opcstart : $base_ty,
-                    $(#[$opcode_meta])*
-                    $vis discrim @ $opcstart .. $opcend : $base_ty,
-                }
-            }
-
-            $(#[$outer_meta])*
-            impl [<$gname Encoded>]{
-                $vis fn decode(self) -> $gname{
-                    match self.discrim().get(){
-                        $($uopc => $gname :: $uop(<$field>::from_bits(self.decodebits())),)*
-                        _ => $gname:: $last_uop(<$last_field>::from_bits(self.bits()))
-                    }
-                }
-            }
-
-            $(#[$outer_meta])*
-            impl $gname{
-                $vis fn encode(self) -> [<$gname Encoded>]{
-                    match self{
-                        $(Self:: $uop(field) => [<$gname Encoded>]::with_discrim(<$base_ty>::new($uopc)).insert_decodebits(field.to_bits()),)*
-                        Self:: $last_uop (last_field) => [<$gname Encoded>]::from_bits(last_field.to_bits())
-                    }
-                }
-            }
-
-            $(#[$outer_meta])*
-            impl<R: ::clever_emu_primitives::bitfield::BitfieldTy> ::clever_emu_primitives::bitfield::FromBitfield<R> for $gname where [<$gname Encoded>]: ::clever_emu_primitives::bitfield::FromBitfield<R>,
-                $($field: ::clever_emu_primitives::bitfield::FromBitfield::<R>,)* $last_field: ::clever_emu_primitives::bitfield::FromBitfield::<R>{
-                fn validate(self) -> bool{
-                    match self{
-                        $( Self:: $uop(payload) => ::clever_emu_primitives::bitfield::FromBitfield::<R>::validate(payload),)*
-                        Self::$last_uop(payload) => ::clever_emu_primitives::bitfield::FromBitfield::<R>::validate(payload)
-                    }
-                }
-
-                fn from_bits(bits: R) -> Self{
-                    <[<$gname Encoded>] as ::clever_emu_primitives::bitfield::FromBitfield::<R>>::from_bits(bits).decode()
-                }
-
-                fn to_bits(self) -> R{
-                    <[<$gname Encoded>] as ::clever_emu_primitives::bitfield::FromBitfield::<R>>::to_bits(self.encode())
-                }
-            }
-
-
-            $(#[$outer_meta])*
-            impl ::clever_emu_primitives::bitfield::DisplayBitfield for $gname{
-                fn present(&self) -> bool{
-                    true
-                }
-
-                fn display(&self, name: &str, f: &mut core::fmt::Formatter) -> core::fmt::Result{
-                    f.write_str(name)?;
-                    f.write_str(": ")?;
-                    ::core::fmt::Display::fmt(self, f)
-                }
-            }
-
-            $(#[$outer_meta])*
-            impl ::core::fmt::Display for $gname{
-                fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result{
-                    match self{
-                        $(Self:: $uop (payload) => payload.fmt(f),)*
-                        Self::$last_uop(payload) => payload.fmt(f)
-                    }
-                }
-            }
-        }
+impl AsDecodeContext for SuperUncondBranch {
+    type Context = SuperBranchOpcode;
+    fn as_context(&self) -> Self::Context {
+        self.opcode()
     }
 }
 
 capturing_enum! {
     #[repr(BeU16)]
     pub enum UserBranch @ 10..12{
-        Uncond(UncondBranch) = 3,
-        #[default] Cond(CondBranch),
+        UncondBranch(UncondBranch) = 3,
+        #[default] CondBranch(CondBranch),
     }
 }
 
 capturing_enum! {
     #[repr(BeU16)]
     pub enum SuperBranch @ 9..12{
-        Uncond(SuperUncondBranch) = 0x6,
+        SuperUncondBranch(SuperUncondBranch) = 0x6,
         MachSpecificInstrs(MachInstr) = 0x7,
         #[default] Cond(InvalidEncoding)
     }

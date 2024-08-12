@@ -17,20 +17,26 @@ macro_rules! safe_union{
     {
         $(#[$meta:meta])*
         $vis:vis union $union_name:ident{
+            $(#![$struct_meta:meta])*
             $($(#[$meta2:meta])* $vis2:vis $field_name:ident : $ty:ty),*  $(,)?
         }
     } => {
         $(#[$meta])*
+        $(#[$struct_meta])*
         #[repr(C)]
         #[derive(Copy, Clone)]
         $vis union $union_name{
+
             $($(#[$meta2])* $vis2 $field_name : $ty),*
 
         }
 
+        $(#[$meta])*
         unsafe impl ::bytemuck::Zeroable for $union_name{}
+        $(#[$meta])*
         unsafe impl ::bytemuck::Pod for $union_name{}
 
+        $(#[$meta])*
         impl $union_name{
             $(
                 #[allow(dead_code)] // private fields might not be called by the method, don't lint on them
@@ -51,9 +57,10 @@ macro_rules! safe_union{
 }
 
 safe_union! {
-    #[repr(align(16))]
     #[cfg(feature = "vector")]
     pub union VectorPair{
+        #![repr(align(16))]
+
         pub u128x1: LeU128,
         pub u64x2:  [LeU64;2],
         pub u32x4:  [LeU32;4],
@@ -84,6 +91,21 @@ bitfield! {
         pub overflow @ 2 : bool,
         pub negative @ 3 : bool,
         pub parity @ 4 : bool,
+    }
+}
+
+impl Flags {
+    pub const CARRY: Flags = Flags::from_bits(LeU64::new(1));
+    pub const ZERO: Flags = Flags::from_bits(LeU64::new(2));
+    pub const OVERFLOW: Flags = Flags::from_bits(LeU64::new(4));
+    pub const NEGATIVE: Flags = Flags::from_bits(LeU64::new(8));
+    pub const PARITY: Flags = Flags::from_bits(LeU64::new(16));
+
+    pub const FLAGS_LOGIC_MASK: Flags = Flags::from_bits(LeU64::new(26));
+    pub const FLAGS_ARITH_MASK: Flags = Flags::from_bits(LeU64::new(31));
+
+    pub fn set_logical(&mut self, vals: Flags) {
+        *self = (*self & !Self::FLAGS_LOGIC_MASK) | vals;
     }
 }
 
@@ -258,6 +280,7 @@ bitfield! {
 safe_union! {
     #[cfg(feature = "crypto")]
     pub union CryptoPair{
+        #![repr(align(16))]
         pub i128x1: LeU128,
         pub i64x2: [LeU64;2],
         pub i32x4: [LeU32; 4],
@@ -349,6 +372,22 @@ impl Regs {
         val.named.cpuid = cpuid;
         val.named.cpuex = cpuid::CPUEX;
         val
+    }
+
+    pub fn validate_wf(&self, regno: CleverRegister) -> CPUResult<()> {
+        match regno {
+            CleverRegister(0..=18) | CleverRegister(128..=145) => Ok(()),
+            CleverRegister(24..=31) | CleverRegister::fpcw => {
+                self.cr0.check_extension(Extension::Float)
+            }
+            CleverRegister(64..=95) => self.cr0.check_extension(Extension::Vector),
+            CleverRegister(32) | CleverRegister(96..=127) => {
+                self.cr0.check_extension(Extension::Crypto)
+            }
+            #[cfg(feature = "rand")]
+            CleverRegister(156) => Ok(()),
+            _ => Err(CPUException::Undefined),
+        }
     }
 
     pub fn validate_before_reading(

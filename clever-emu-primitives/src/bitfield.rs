@@ -9,15 +9,17 @@ macro_rules! bitfield{
     {
         $(#[$meta:meta])*
         $vis:vis struct $bitfield_ty:ident : $base_ty:ty{
+            $(#![$struct_meta:meta])*
             $($(#[$meta2:meta])* $vis2:vis $field_name:ident @ $placement_start:literal $(.. $placement_end:literal)? : $ty:ty ),*
             $(,)?
         }
     } => {
 
         $(#[$meta])*
+        $(#[$struct_meta])*
         #[derive(Copy, Clone, PartialEq, Eq, Hash, Default, Debug, $crate::bitfield::__exports::Zeroable, $crate::bitfield::__exports::Pod)]
         #[repr(transparent)]
-        $vis struct $bitfield_ty($base_ty);
+        $vis struct $bitfield_ty{__bits: $base_ty}
 
         const _: () = {
             fn test() -> impl $crate::bitfield::BitfieldTy{
@@ -25,14 +27,19 @@ macro_rules! bitfield{
             }
         };
 
+        $(#[$meta])*
         impl $bitfield_ty{
 
+            $vis const fn empty() -> Self{
+                Self::from_bits(<$base_ty>::new(0))
+            }
+
             $vis const fn from_bits(val: $base_ty) -> Self{
-                Self(val)
+                Self{__bits: val}
             }
 
             $vis const fn bits(self) -> $base_ty{
-                self.0
+                self.__bits
             }
 
             #[allow(unused_mut)]
@@ -41,11 +48,11 @@ macro_rules! bitfield{
                 let mut field = <$base_ty>::new(0);
                 let mut fields_valid = true;
 
-                $($(#[$meta2])*{
+                $($(#[$meta2])*let _ = {
                     let placement = $placement_start $(.. $placement_end)?;
                     field = $crate::bitfield::BitfieldPosition::insert(&placement, field, <$base_ty>::new(!0));
                     fields_valid |= $crate::bitfield::FromBitfield::<$base_ty>::validate(self. $field_name ());
-                })*
+                };)*
 
                 ((self.bits() & !field) == 0) && fields_valid
             }
@@ -55,7 +62,7 @@ macro_rules! bitfield{
                 $(#[$meta2])*
                 $vis2 fn $field_name(&self) -> $ty{
                     let placement = $placement_start $(.. $placement_end)?;
-                    let bits = $crate::bitfield::BitfieldPosition::extract(&placement,self.0);
+                    let bits = $crate::bitfield::BitfieldPosition::extract(&placement,self.__bits);
 
                     $crate::bitfield::FromBitfield::from_bits(bits)
                 }
@@ -69,7 +76,7 @@ macro_rules! bitfield{
 
                         let bits = $crate::bitfield::FromBitfield::to_bits(val);
 
-                        Self($crate::bitfield::BitfieldPosition::insert(&placement, $crate::const_zeroed_safe(), bits))
+                        Self{__bits: $crate::bitfield::BitfieldPosition::insert(&placement, $crate::const_zeroed_safe(), bits)}
                     }
 
                     #[inline]
@@ -79,7 +86,7 @@ macro_rules! bitfield{
 
                         let bits = $crate::bitfield::FromBitfield::to_bits(val);
 
-                        self.0 = $crate::bitfield::BitfieldPosition::insert(&placement, self.0, bits);
+                        self.__bits = $crate::bitfield::BitfieldPosition::insert(&placement, self.__bits, bits);
                         self
                     }
 
@@ -90,36 +97,40 @@ macro_rules! bitfield{
 
                         let bits = $crate::bitfield::FromBitfield::to_bits(val);
 
-                        self.0 = $crate::bitfield::BitfieldPosition::insert(&placement, self.0, bits);
+                        self.__bits = $crate::bitfield::BitfieldPosition::insert(&placement, self.__bits, bits);
                     }
                 }
             )*
         }
 
+        $(#[$meta])*
         impl ::core::ops::BitAnd for $bitfield_ty{
             type Output = Self;
             #[inline]
             fn bitand(self, rhs: Self) -> Self{
-                Self(self.0 & rhs.0)
+                Self{__bits: self.__bits & rhs.__bits}
             }
         }
 
+        $(#[$meta])*
         impl ::core::ops::BitOr for $bitfield_ty{
             type Output = Self;
             #[inline]
             fn bitor(self, rhs: Self) -> Self{
-                Self(self.0 | rhs.0)
+                Self{__bits: self.__bits | rhs.__bits}
             }
         }
 
+        $(#[$meta])*
         impl ::core::ops::BitXor for $bitfield_ty{
             type Output = Self;
             #[inline]
             fn bitxor(self, rhs: Self) -> Self{
-                Self(self.0 ^ rhs.0)
+                Self{__bits: self.__bits ^ rhs.__bits}
             }
         }
 
+        $(#[$meta])*
         impl ::core::ops::BitAndAssign for $bitfield_ty{
             #[inline]
             fn bitand_assign(&mut self, rhs: Self){
@@ -127,6 +138,7 @@ macro_rules! bitfield{
             }
         }
 
+        $(#[$meta])*
         impl ::core::ops::BitOrAssign for $bitfield_ty{
             #[inline]
             fn bitor_assign(&mut self, rhs: Self){
@@ -134,6 +146,7 @@ macro_rules! bitfield{
             }
         }
 
+        $(#[$meta])*
         impl ::core::ops::BitXorAssign for $bitfield_ty{
             #[inline]
             fn bitxor_assign(&mut self, rhs: Self){
@@ -141,21 +154,23 @@ macro_rules! bitfield{
             }
         }
 
+        $(#[$meta])*
         impl ::core::ops::Not for $bitfield_ty{
             type Output = Self;
 
             #[inline]
             fn not(self) -> Self{
-                Self(!self.0)
+                Self{__bits: !self.__bits}
             }
         }
 
-
+        $(#[$meta])*
         impl ::core::fmt::Display for $bitfield_ty{
             #[allow(unused_variables, unused_mut, unused_assignments)]
             fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result{
                 let mut sep = "";
                 $(
+                    $(#[$meta2])*
                     {
                         let field = self.$field_name();
                         if $crate::bitfield::DisplayBitfield::present(&field){
@@ -170,6 +185,7 @@ macro_rules! bitfield{
             }
         }
 
+        $(#[$meta])*
         impl<T> $crate::bitfield::FromBitfield<T> for $bitfield_ty where T: $crate::bitfield::BitfieldTy,
             $base_ty: $crate::bitfield::FromBitfield<T>{
             fn from_bits(bits: T) -> Self{
@@ -184,12 +200,18 @@ macro_rules! bitfield{
             }
         }
 
+        $(#[$meta])*
         impl $crate::bitfield::DisplayBitfield for $bitfield_ty{
             fn present(&self) -> bool{
-                $(({
+
+                let mut present = false;
+
+                $($(#[$meta2])* {
                     let field = self.$field_name();
-                    $crate::bitfield::DisplayBitfield::present(&field)
-                }) |)* false
+                    present |= $crate::bitfield::DisplayBitfield::present(&field);
+                })*
+
+                present
             }
             fn display(&self, name: &str,f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result{
                 f.write_fmt(::core::format_args!("{}({})",name,self))

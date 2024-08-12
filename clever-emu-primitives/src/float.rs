@@ -276,6 +276,12 @@ impl<T: FloatRepr> CleverFloat<T> {
     pub const RADIX: u32 = 2;
     pub const MANTISSA_DIGITS: u32 = T::MANT_BITS + 1;
 
+    fn signed_zero(sign: bool) -> Self {
+        let sign = T::from_bits(sign as u32) << (T::EXP_BITS + T::MANT_BITS);
+
+        Self(sign)
+    }
+
     fn exp_exponent() -> T {
         let mask = !T::ZERO;
 
@@ -349,6 +355,12 @@ impl<T: FloatRepr> CleverFloat<T> {
         (sign_bit != T::ZERO, exp, mant)
     }
 
+    fn mul_sign(self, other: Self) -> Self {
+        let sign = other.0 & !(T::ONE << (T::EXP_BITS + T::MANT_BITS));
+
+        Self(self.0 ^ sign)
+    }
+
     pub fn negate(self) -> Self {
         let Self(val) = self;
         let one = T::ONE;
@@ -418,7 +430,7 @@ impl<T: FloatRepr> CleverFloat<T> {
     fn mul_add_impl(
         a_mant: T,
         b_mant: T,
-        mut c_mant: T,
+        c_mant: T,
         mut prod_exp: T,
         c_exp: T,
         prod_sign: bool,
@@ -427,15 +439,81 @@ impl<T: FloatRepr> CleverFloat<T> {
     ) -> FloatResult<Self> {
         let (mut prod_hi, mut prod_lo) = T::widening_mul(a_mant, b_mant);
 
+        prod_exp += T::from_bits(T::MANT_BITS + 2);
+
+        let (mut c_mant_hi, mut c_mant_lo) = (T::ZERO, c_mant);
+
         todo!()
     }
 
     pub fn mul_add_round(self, b: Self, c: Self, rnd: RoundingMode) -> FloatResult<Self> {
-        todo!()
+        match (self.classify(), b.classify(), c.classify()) {
+            (FpCategory::Nan, _, _) => Ok(self),
+            (_, FpCategory::Nan, _) => Ok(b),
+            (_, _, FpCategory::Nan) => Ok(c),
+            (
+                FpCategory::Zero,
+                FpCategory::Normal | FpCategory::Subnormal | FpCategory::Zero,
+                _,
+            )
+            | (FpCategory::Normal | FpCategory::Subnormal, FpCategory::Zero, _) => Ok(c),
+            (
+                FpCategory::Infinite,
+                FpCategory::Normal | FpCategory::Subnormal | FpCategory::Infinite,
+                FpCategory::Normal | FpCategory::Subnormal | FpCategory::Zero,
+            ) => Ok(self.mul_sign(b)),
+            (
+                FpCategory::Normal | FpCategory::Subnormal,
+                FpCategory::Infinite,
+                FpCategory::Normal | FpCategory::Subnormal | FpCategory::Zero,
+            ) => Ok(b.mul_sign(self)),
+            (
+                FpCategory::Infinite,
+                FpCategory::Normal | FpCategory::Subnormal | FpCategory::Infinite,
+                FpCategory::Infinite,
+            )
+            | (
+                FpCategory::Normal | FpCategory::Subnormal,
+                FpCategory::Infinite,
+                FpCategory::Infinite,
+            ) => {
+                let (this_sign, _, _) = self.extract_fields();
+                let (b_sign, _, _) = b.extract_fields();
+                let (c_sign, _, _) = c.extract_fields();
+
+                if (this_sign ^ b_sign) != c_sign {
+                    Err((FpException::with_invalid(true), Self::non_const_nan()))
+                } else {
+                    Ok(c)
+                }
+            }
+            (FpCategory::Subnormal, _, _) | (_, FpCategory::Subnormal, _) => {
+                todo!("subnormals in product")
+            }
+            (_, _, _) => {
+                let (this_sign, this_exp, mut this_mant) = self.extract_fields();
+                let (b_sign, b_exp, mut b_mant) = b.extract_fields();
+                let (c_sign, c_exp, mut c_mant) = c.extract_fields();
+                let prod_sign = this_sign ^ b_sign;
+                this_mant =
+                    (this_mant | (T::from_bits(self.is_normal() as u32) << T::MANT_BITS)) << 1;
+                b_mant = (b_mant | (T::from_bits(b.is_normal() as u32) << T::MANT_BITS)) << 1;
+                c_mant = (c_mant | (T::from_bits(c.is_normal() as u32) << T::MANT_BITS)) << 1;
+
+                let prod_exp = this_exp + b_exp;
+                Self::mul_add_impl(
+                    this_mant, b_mant, c_mant, prod_exp, c_exp, prod_sign, c_sign, rnd,
+                )
+            }
+        }
     }
 
     pub fn add_round(self, b: Self, rnd: RoundingMode) -> FloatResult<Self> {
         self.mul_add_round(Self::non_const_one(), b, rnd)
+    }
+
+    pub fn mul_round(self, b: Self, rnd: RoundingMode) -> FloatResult<Self> {
+        self.mul_add_round(b, Self::ZERO, rnd)
     }
 }
 

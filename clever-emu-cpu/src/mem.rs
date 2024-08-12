@@ -30,6 +30,8 @@ enum PadZero {
     Zero = 0,
 }
 
+pub type DataCacheLockGuard<'a> = LocalMemoryLockGuard<'a, L2Cache>;
+
 pub struct DataCache {
     cache: L1Cache,
     line_buffer: UnsafeCell<Option<(LeU64, PadZero, [CacheLine; 2])>>,
@@ -169,7 +171,7 @@ impl DataCache {
 
     /// Locks the cache line that `paddr` belongs to.
     /// For convience, this can take an unaligned `paddr`, and the function will align it downwards to the same cache line
-    pub fn lock(&self, paddr: LeU64) -> MemoryResult<LocalMemoryLockGuard<L2Cache>> {
+    pub fn lock(&self, paddr: LeU64) -> MemoryResult<DataCacheLockGuard> {
         self.cache
             .lock_blocking(paddr & !(CacheLine::SIZE - 1))
             .map(|(a, _)| a)

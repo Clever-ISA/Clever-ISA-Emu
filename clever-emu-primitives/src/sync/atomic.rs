@@ -69,76 +69,50 @@ macro_rules! def_atomic_base{
                     }
                 }
 
-                #[cfg(target_byte_order = $order)]
+                #[cfg(target_endian = $order)]
                 #[inline]
                 pub fn fetch_add(&self, val: $int_ty, ord: Ordering) -> $int_ty{
-                    crate::const_transmute_safe(self.0.fetch_add(crate::const_transmute_safe(val)))
+                    crate::const_transmute_safe(self.0.fetch_add(crate::const_transmute_safe(val), ord))
                 }
 
-                #[cfg(not(target_byte_order = $order))]
+                #[cfg(not(target_endian = $order))]
                 #[inline]
                 pub fn fetch_add(&self, val: $int_ty, ord: Ordering) -> $int_ty{
                     self.fetch_update(Ordering::Relaxed, ord, |x| Some(x.wrapping_add(val))).unwrap()
                 }
 
-                #[cfg(target_byte_order = $order)]
+                #[cfg(target_endian = $order)]
                 #[inline]
                 pub fn fetch_sub(&self, val: $int_ty, ord: Ordering) -> $int_ty{
-                    crate::const_transmute_safe(self.0.fetch_sub(crate::const_transmute_safe(val)))
+                    crate::const_transmute_safe(self.0.fetch_sub(crate::const_transmute_safe(val), ord))
                 }
 
-                #[cfg(not(target_byte_order = $order))]
+                #[cfg(not(target_endian = $order))]
                 #[inline]
                 pub fn fetch_sub(&self, val: $int_ty, ord: Ordering) -> $int_ty{
                     self.fetch_update(Ordering::Relaxed, ord, |x| Some(x.wrapping_sub(val))).unwrap()
                 }
 
-                #[cfg(target_byte_order = $order)]
                 #[inline]
                 pub fn fetch_and(&self, val: $int_ty, ord: Ordering) -> $int_ty{
-                    crate::const_transmute_safe(self.0.fetch_and(crate::const_transmute_safe(val)))
+                    crate::const_transmute_safe(self.0.fetch_and(crate::const_transmute_safe(val), ord))
                 }
 
-                #[cfg(not(target_byte_order = $order))]
-                #[inline]
-                pub fn fetch_and(&self, val: $int_ty, ord: Ordering) -> $int_ty{
-                    self.fetch_update(Ordering::Relaxed, ord, |x| Some(x & val)).unwrap()
-                }
 
-                #[cfg(target_byte_order = $order)]
                 #[inline]
                 pub fn fetch_or(&self, val: $int_ty, ord: Ordering) -> $int_ty{
-                    crate::const_transmute_safe(self.0.fetch_or(crate::const_transmute_safe(val)))
+                    crate::const_transmute_safe(self.0.fetch_or(crate::const_transmute_safe(val), ord))
                 }
 
-                #[cfg(not(target_byte_order = $order))]
-                #[inline]
-                pub fn fetch_or(&self, val: $int_ty, ord: Ordering) -> $int_ty{
-                    self.fetch_update(Ordering::Relaxed, ord, |x| Some(x | val)).unwrap()
-                }
 
-                #[cfg(target_byte_order = $order)]
                 #[inline]
                 pub fn fetch_nand(&self, val: $int_ty, ord: Ordering) -> $int_ty{
-                    crate::const_transmute_safe(self.0.fetch_nand(crate::const_transmute_safe(val)))
+                    crate::const_transmute_safe(self.0.fetch_nand(crate::const_transmute_safe(val), ord))
                 }
 
-                #[cfg(not(target_byte_order = $order))]
-                #[inline]
-                pub fn fetch_nand(&self, val: $int_ty, ord: Ordering) -> $int_ty{
-                    self.fetch_update(Ordering::Relaxed, ord, |x| Some(!(x & val))).unwrap()
-                }
-
-                #[cfg(target_byte_order = $order)]
                 #[inline]
                 pub fn fetch_xor(&self, val: $int_ty, ord: Ordering) -> $int_ty{
-                    crate::const_transmute_safe(self.0.fetch_xor(crate::const_transmute_safe(val)))
-                }
-
-                #[cfg(not(target_byte_order = $order))]
-                #[inline]
-                pub fn fetch_xor(&self, val: $int_ty, ord: Ordering) -> $int_ty{
-                    self.fetch_update(Ordering::Relaxed, ord, |x| Some(x ^ val)).unwrap()
+                    crate::const_transmute_safe(self.0.fetch_xor(crate::const_transmute_safe(val), ord))
                 }
             }
         )*

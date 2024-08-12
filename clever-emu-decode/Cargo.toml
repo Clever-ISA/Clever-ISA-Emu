@@ -7,6 +7,7 @@ edition = "2021"
 clever-emu-primitives.workspace = true
 clever-emu-regs.workspace = true
 clever-emu-types.workspace = true
+clever-emu-errors.workspace = true
 bytemuck.workspace = true
 paste.workspace = true
 
