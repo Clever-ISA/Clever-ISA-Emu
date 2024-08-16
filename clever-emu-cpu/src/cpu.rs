@@ -1040,6 +1040,21 @@ impl Cpu {
                 }
                 Ok(())
             }
+            Instruction::Mul(h) => {
+                let val1 = self.regs.gprs[0] & h.size().as_regwidth_mask();
+                let val2 = self.regs.gprs[3] & h.size().as_regwidth_mask();
+
+                let (lo, hi) = val1.widening_mul(val2);
+
+                let real_hi = (hi.rangeless_shl(64 - h.size().as_bits())
+                    | lo.rangeless_shr(h.size().as_bits()))
+                    & h.size().as_regwidth_mask();
+
+                self.regs.gprs[0] = lo & h.size().as_regwidth_mask();
+                self.regs.gprs[3] = real_hi;
+
+                Ok(())
+            }
             _ => Err(CPUException::Undefined),
         }
     }

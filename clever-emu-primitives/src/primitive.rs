@@ -503,6 +503,22 @@ macro_rules! def_fix_endian_integers{
                 $vis const fn wrapping_mul(self, val: $le_int_ty) -> Self{
                     Self::new(self.get().wrapping_mul(val.get()))
                 }
+
+                $vis const fn rangeless_shl(self, val: u32) -> Self{
+                    if val < Self::BITS{
+                        Self::new(self.get() << val)
+                    }else{
+                        Self::new(0)
+                    }
+                }
+
+                $vis const fn rangeless_shr(self, val: u32) -> Self{
+                    if val < Self::BITS{
+                        Self::new(self.get() << val)
+                    }else{
+                        Self::new((self.get() >> (Self::BITS - 1)) >> 1)
+                    }
+                }
             }
 
             impl ::core::convert::From<$base_ty> for $le_int_ty{
