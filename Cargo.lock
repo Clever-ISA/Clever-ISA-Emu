@@ -267,6 +267,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
+name = "clever-emu"
+version = "0.1.0"
+dependencies = [
+ "clever-emu-aci",
+ "clever-emu-cpu",
+ "clever-emu-mem",
+ "clever-emu-storage",
+ "clever-emu-wgpu",
+]
+
+[[package]]
 name = "clever-emu-aci"
 version = "0.1.0"
 dependencies = [
@@ -290,6 +301,8 @@ dependencies = [
  "clever-emu-regs",
  "clever-emu-types",
  "lru_time_cache",
+ "rand",
+ "rand_chacha",
 ]
 
 [[package]]

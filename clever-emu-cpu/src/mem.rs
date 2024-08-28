@@ -207,13 +207,16 @@ impl InstrCache {
         self.cache.invalidate_all_local();
 
         let fetch_buffer = unsafe { &mut *self.fetch_buffer.get() };
+        fetch_buffer.offset = !0;
+
+        
         let offset = (new_ip & (CacheLine::SIZE - 1)).get() as usize;
-        let line = new_ip & !(CacheLine::SIZE - 1);
+        let line_addr = new_ip & !(CacheLine::SIZE - 1);
+
+        let (line, _) = self.cache.read_blocking(line_addr)?;
 
         fetch_buffer.offset = offset >> 1;
-        fetch_buffer.cur_line = line;
-
-        let (line, _) = self.cache.read_blocking(line)?;
+        fetch_buffer.cur_line = line_addr;
 
         fetch_buffer.line = const_transmute_safe(line);
 

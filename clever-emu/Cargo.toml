@@ -1,0 +1,31 @@
+[package]
+name = "clever-emu"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clever-emu-cpu.workspace = true
+clever-emu-aci = { workspace = true, optional = true }
+clever-emu-wgpu = { workspace = true, optional = true }
+clever-emu-storage = { workspace = true, optional = true }
+clever-emu-mem.workspace = true
+
+[features]
+float = ["clever-emu-cpu/float"]                       # X-float
+vector = ["clever-emu-cpu/vector"]                     # X-vector
+float-ext = ["float", "clever-emu-cpu/float-ext"]      # X-float-ext
+rand = ["clever-emu-cpu/rand"]                         # X-rand
+hash-accel = ["clever-emu-cpu/hash-accel"]             # X-hash-accel
+crypto = ["clever-emu-cpu/crypto"]                     # X-crypto
+'clever1.0' = ["float", "vector", "float-ext", "rand"]
+aci = ["dep:clever-emu-aci", "clever-emu-storage/aci"]
+wgpu = ["aci", "dep:clever-emu-wgpu"]
+wgpu-shaders = ["wgpu", "clever-emu-wgpu/shaders"]
+storage = ["dep:clever-emu-storage"]
+iodma = ["storage", "clever-emu-storage/iodma"]
+spi = ["storage", "clever-emu-storage/spi"]
+# scsi = ["clever-emu-storage/sci"]
+ahci = ["storage", "clever-emu-storage/ahci"]
+vhd = ["storage", "clever-emu-storage/vhd"]
+default = ["clever1.0", "aci", "wgpu", "iodma", "ahci", "vhd"]
+# multithreading = ["clever-emu-cpu/multithreading"]

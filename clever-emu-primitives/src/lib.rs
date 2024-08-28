@@ -1,5 +1,6 @@
 #![feature(cfg_target_has_atomic, strict_provenance)]
 #![feature(bigint_helper_methods, const_bigint_helper_methods)]
+#![feature(unbounded_shifts, const_unbounded_shifts)]
 
 use bytemuck::{AnyBitPattern, NoUninit, Zeroable};
 

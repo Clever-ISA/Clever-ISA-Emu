@@ -4,12 +4,20 @@ use clever_emu_decode::{
     instr::{Instruction, Operand},
 };
 use clever_emu_errors::{AccessKind, CPUException, CPUResult, FaultCharacteristics, FaultStatus};
-use clever_emu_regs::{Flags, Regs};
+use clever_emu_regs::{Flags, Mode, Regs};
 use clever_emu_types::{
     CleverRegister, CpuExecutionMode, Extension, ShiftSizeControl, SizeControl,
 };
+#[cfg(feature = "rand")]
+use rand::{thread_rng, SeedableRng};
 
-use crate::mem::{AddrResolver, DataCache, DataCacheLockGuard, InstrCache, L2Cache};
+#[cfg(feature = "rand")]
+use clever_emu_regs::RPollInfo;
+
+use crate::{
+    interrupt::{ItabEntry, ItabHeader},
+    mem::{AddrResolver, DataCache, DataCacheLockGuard, InstrCache, L2Cache},
+};
 use clever_emu_mem::{
     bus::{GlobalMemory, LocalMemory, LocalMemoryLockGuard},
     cache::CacheLine,
@@ -18,9 +26,12 @@ use clever_emu_mem::{
 };
 
 use core::borrow::Borrow;
-use std::{cell::Cell, sync::Arc};
+use std::{
+    cell::Cell,
+    sync::{atomic::Ordering, Arc},
+};
 
-use clever_emu_primitives::primitive::*;
+use clever_emu_primitives::{primitive::*, sync::atomic::AtomicLeU32};
 
 pub struct Cpu {
     regs: Regs,
@@ -29,10 +40,15 @@ pub struct Cpu {
     l1icache: InstrCache,
     addr_resolver: AddrResolver,
     fetch_ip: Cell<LeI64>,
+    status_register: AtomicLeU32,
+    #[cfg(feature = "rand")]
+    rand_dev: rand_chacha::ChaCha20Rng,
 }
 
 #[derive(Copy, Clone)]
 pub struct CpuMemorySizes {
+    pub sys_mem_size: usize,
+    pub l3size: usize,
     pub l2size: usize,
     pub l1dsize: usize,
     pub l1isize: usize,
@@ -44,8 +60,24 @@ pub struct CpuMemorySizes {
 }
 
 impl Default for CpuMemorySizes {
+    #[cfg(not(target_pointer_width = "32"))]
     fn default() -> Self {
         Self {
+            sys_mem_size: 4096 * 4096 * 128,
+            l3size: 4096 * 1024,
+            l2size: 1024 * 1024,
+            l1dsize: 256 * 1024,
+            l1isize: 256 * 1024,
+            l1asize: 128 * 1024,
+            tlbsize: 512,
+            __non_exhaustive: (),
+        }
+    }
+    #[cfg(target_pointer_width = "32")]
+    fn default() -> Self {
+        Self {
+            sys_mem_size: 4096 * 4096 * 32,
+            l3size: 4096 * 1024,
             l2size: 1024 * 1024,
             l1dsize: 256 * 1024,
             l1isize: 256 * 1024,
@@ -93,8 +125,8 @@ pub fn compute_arithmetic<F: Fn(LeU64, LeU64) -> (LeU64, bool)>(
 ) -> (LeU64, Flags) {
     let (res_val, full_carry) = f(val1, val2);
 
-    let carry =
-        (full_carry & (ss == SizeControl::Double)) | ((res_val & ss.as_rangeless_shift_1()) != 0);
+    let carry = (full_carry & (ss == SizeControl::Double))
+        | ((res_val & LeU64::new(1).unbounded_shl(ss.as_bits())) != 0);
 
     let sign_bit = LeU64::new(1) << (ss.as_bits() - 1);
     let overflow = ((val1 ^ val2 ^ res_val) & sign_bit).get() != carry as u64;
@@ -138,6 +170,24 @@ impl Cpu {
             l1icache: InstrCache::new(l1isize, l2cache_instr),
             addr_resolver: AddrResolver::new(l1asize, memory_sizes.tlbsize, l2cache_addr),
             fetch_ip: Cell::new(LeI64::new(0xff00)),
+            status_register: AtomicLeU32::new(LeU32::new(0)),
+            #[cfg(feature = "rand")]
+            rand_dev: rand_chacha::ChaCha20Rng::from_rng(thread_rng())
+                .expect("We should be able to seed the generator"),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        (self.status_register.load(Ordering::Relaxed) & 1) != 0
+    }
+
+    pub fn enable(&self, enabled: bool) {
+        if enabled {
+            self.status_register
+                .fetch_or(LeU32::new(1), Ordering::Relaxed);
+        } else {
+            self.status_register
+                .fetch_nand(LeU32::new(1), Ordering::Relaxed);
         }
     }
 
@@ -424,6 +474,99 @@ impl Cpu {
         }
     }
 
+    fn handle_interrupt_internal(&mut self, inum: LeU8, xm: CpuExecutionMode) -> CPUResult<()> {
+        let offset = inum.unsigned_as::<LeU64>() * ItabEntry::SIZE + ItabEntry::SIZE;
+
+        let (save_sp, save_ip, save_flags, save_mode) = (
+            self.regs.gprs[7],
+            self.regs.ip,
+            self.regs.flags,
+            self.regs.mode,
+        );
+
+        let itabp = self.regs.itabp;
+
+        if (itabp & (ItabEntry::SIZE.cast_sign() - 1)) != 0 {
+            return Err(CPUException::SystemProtection(LeU64::new(0)));
+        }
+
+        let itab_header =
+            self.read_privileged::<ItabHeader>(itabp, CpuExecutionMode::Supervisor)?;
+
+        let extent = itab_header.size;
+
+        if (extent & (ItabEntry::SIZE - 1)) != 0 {
+            return Err(CPUException::SystemProtection(LeU64::new(0)));
+        }
+
+        if extent < (offset + ItabEntry::SIZE) {
+            return Err(CPUException::SystemProtection(LeU64::new(0)));
+        }
+
+        let eptr = itabp + offset.cast_sign();
+
+        let entry = self.read_privileged::<ItabEntry>(eptr, CpuExecutionMode::Supervisor)?;
+
+        if !entry.flags.validate() || !entry.flags.present() || entry.flags.px().mode() < xm {
+            return Err(CPUException::SystemProtection(LeU64::new(0)));
+        }
+
+        if (entry.ip & 1) != 0 {
+            return Err(CPUException::ExecutionAlignment(entry.ip));
+        }
+
+        let mode = Mode::from_bits(entry.mode);
+
+        if !mode.validate() {
+            return Err(CPUException::SystemProtection(LeU64::new(0)));
+        }
+
+        self.write_privileged(
+            entry.sp,
+            &[
+                save_sp,
+                save_ip.cast_sign(),
+                save_flags.bits(),
+                save_mode.bits(),
+            ],
+            CpuExecutionMode::Supervisor,
+        )?;
+        self.regs.ip = entry.ip;
+        self.regs.gprs[7] = entry.sp.cast_sign();
+        self.regs.gprs[7] -= 32;
+
+        self.regs.mode = mode;
+
+        let new_ip = self.addr_resolver.resolve_vaddr(
+            self.regs.ip,
+            AccessKind::Execute,
+            mode.xm().mode(),
+        )?;
+
+        let _ = self.l1icache.reposition_after_mode_switch(new_ip);
+
+        Ok(())
+    }
+
+    pub fn handle_exception(&mut self, ex: CPUException) -> CPUResult<()> {
+        if ex == CPUException::Reset {
+            return Err(CPUException::Reset);
+        }
+        self.regs.fcode = ex.fault_code().unwrap_or(LeU64::new(!0));
+        self.handle_interrupt_internal(ex.exception_num(), CpuExecutionMode::Supervisor)?;
+
+        match ex {
+            CPUException::PageFault(_, info) => {
+                if self.regs.pfcharptr != 0 {
+                    self.write_privileged(self.regs.pfcharptr, &info, CpuExecutionMode::Supervisor)
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub fn as_instruction_stream(&self) -> Stream {
         Stream(self)
     }
@@ -616,6 +759,12 @@ impl Cpu {
             Operand::LargeImm(cs, _) if cs.mem() => Ok(()),
             _ => Err(CPUException::Undefined),
         }
+    }
+
+    pub fn check_mode(&self, required_rights: CpuExecutionMode) -> CPUResult<()> {
+        self.current_mode()
+            .check_mode(required_rights)
+            .map_err(|_| CPUException::SystemProtection(LeU64::new(0)))
     }
 
     pub fn validate_write(&self, op: &Operand, val: LeU64) -> CPUResult<()> {
@@ -881,7 +1030,7 @@ impl Cpu {
 
     pub fn tick(&mut self) -> CPUResult<()> {
         match self.as_instruction_stream().fetch::<Instruction>()? {
-            Instruction::Und(_) | Instruction::UndFFF(_) => Err(CPUException::Undefined),
+            Instruction::Und(_) | Instruction::UndFFF(_) => Err(CPUException::Undefined)?,
             Instruction::Add(h, dest, src) => {
                 self.check_wf(&dest)?;
                 self.check_wf(&src)?;
@@ -914,7 +1063,6 @@ impl Cpu {
                 if !h.supress_flags() {
                     self.regs.flags = flags;
                 }
-                Ok(())
             }
             Instruction::Sub(h, dest, src) => {
                 self.check_wf(&dest)?;
@@ -948,7 +1096,6 @@ impl Cpu {
                 if !h.supress_flags() {
                     self.regs.flags = flags;
                 }
-                Ok(())
             }
             Instruction::And(h, dest, src) => {
                 self.check_wf(&dest)?;
@@ -978,7 +1125,6 @@ impl Cpu {
                 if !h.supress_flags() {
                     self.regs.flags.set_logical(flags);
                 }
-                Ok(())
             }
             Instruction::Or(h, dest, src) => {
                 self.check_wf(&dest)?;
@@ -1008,7 +1154,6 @@ impl Cpu {
                 if !h.supress_flags() {
                     self.regs.flags.set_logical(flags);
                 }
-                Ok(())
             }
             Instruction::Xor(h, dest, src) => {
                 self.check_wf(&dest)?;
@@ -1038,7 +1183,6 @@ impl Cpu {
                 if !h.supress_flags() {
                     self.regs.flags.set_logical(flags);
                 }
-                Ok(())
             }
             Instruction::Mul(h) => {
                 let val1 = self.regs.gprs[0] & h.size().as_regwidth_mask();
@@ -1046,16 +1190,49 @@ impl Cpu {
 
                 let (lo, hi) = val1.widening_mul(val2);
 
-                let real_hi = (hi.rangeless_shl(64 - h.size().as_bits())
-                    | lo.rangeless_shr(h.size().as_bits()))
+                let real_hi = (hi.unbounded_shl(64 - h.size().as_bits())
+                    | lo.unbounded_shr(h.size().as_bits()))
                     & h.size().as_regwidth_mask();
 
                 self.regs.gprs[0] = lo & h.size().as_regwidth_mask();
                 self.regs.gprs[3] = real_hi;
-
-                Ok(())
             }
-            _ => Err(CPUException::Undefined),
+            Instruction::Mov(h, dest, src) => {
+                self.check_wf(&dest)?;
+                self.check_wf(&src)?;
+                self.check_writable(&dest)?;
+                self.check_simple([&dest, &src])?;
+                let val = self.read_op(&src)?;
+
+                let flags = logical_flags(val, self.op_size(&dest));
+
+                self.write_op(&dest, val)?;
+
+                if !h.supress_flags() {
+                    self.regs.flags.set_logical(flags);
+                }
+            }
+
+            #[cfg(feature = "rand")]
+            Instruction::Rpoll(h) => {
+                use rand::RngCore;
+                if !self.regs.cr0.xmrand() {
+                    self.check_mode(CpuExecutionMode::Supervisor)?;
+                }
+
+                let val = self.rand_dev.next_u64();
+
+                self.regs[h.reg()] = LeU64::new(val);
+
+                self.regs.rpollinfo = RPollInfo::from_bits(LeU64::new(0));
+
+                self.regs.flags.set_parity(true);
+            }
+            _ => Err(CPUException::Undefined)?,
         }
+
+        self.regs.ip = self.fetch_ip.get();
+
+        Ok(())
     }
 }

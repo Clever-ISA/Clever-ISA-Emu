@@ -38,18 +38,13 @@ impl SizeControl {
     }
 
     #[inline]
-    pub fn as_rangeless_shift_1(self) -> LeU64 {
-        LeU64::new(2) << (self.as_bits() - 1)
-    }
-
-    #[inline]
     pub fn as_regwidth_mask(self) -> LeU64 {
-        self.as_rangeless_shift_1() - 1
+        LeU64::new(1).unbounded_shl(self.as_bits()) - 1
     }
 
     #[inline]
     pub fn as_vectorwidth_mask(self) -> LeU128 {
-        (LeU128::new(2) << (self.as_bits() - 1)) - 1
+        LeU128::new(1).unbounded_shl(self.as_bits()) - 1
     }
 
     #[inline]
@@ -114,31 +109,35 @@ impl ShiftSizeControl {
     }
 
     #[inline]
-    pub fn as_bits(self) -> LeU64 {
-        LeU64::new(16) << self.0.unsigned_as::<LeU64>()
+    pub fn as_bits(self) -> u32 {
+        16 << self.0.unsigned_as::<LeU32>().get()
     }
 
     #[inline]
     pub fn as_bytes(self) -> usize {
-        1 << self.0.unsigned_as::<LeU32>().get()
+        2 << self.0.unsigned_as::<LeU32>().get()
     }
 
     #[inline]
     pub fn as_regwidth_mask(self) -> LeU64 {
-        LeU64::new(2) << (self.as_bits() - 1)
+        LeU64::new(1)
+            .unbounded_shl(self.as_bits())
+            .wrapping_sub(LeU64::new(1))
     }
 
     #[inline]
     pub fn as_vectorwidth_mask(self) -> LeU128 {
-        LeU128::new(2) << (self.as_bits() - 1).unsigned_as::<LeU128>()
+        LeU128::new(1)
+            .unbounded_shl(self.as_bits())
+            .wrapping_sub(LeU128::new(1))
     }
 
     #[inline]
     pub fn sign_extend(self, val: LeI64) -> LeI64 {
         assert!(self.as_bits() <= 64);
-        let inv_width = 64 - self.as_bits().get() as u32;
+        let inv_width = 64 - self.as_bits();
 
-        ((val << inv_width) >> inv_width)
+        (val << inv_width) >> inv_width
     }
 }
 

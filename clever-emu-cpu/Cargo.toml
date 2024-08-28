@@ -12,11 +12,32 @@ clever-emu-decode.workspace = true
 clever-emu-types.workspace = true
 bytemuck.workspace = true
 lru_time_cache.workspace = true
+rand = { workspace = true, optional = true }
+rand_chacha = { version = "0.3.1", optional = true }
 
 [features]
-float = ["clever-emu-primitives/float", "clever-emu-errors/float", "clever-emu-regs/float", "clever-emu-decode/float"] # X-float
-vector = ["clever-emu-regs/vector"] # X-vector
-float-ext = ["float", "clever-emu-regs/float-ext"] # X-float-ext
-rand = ["clever-emu-regs/rand"] # X-rand
-hash-accel = ["clever-emu-regs/hash-accel"] # X-hash-accel
-crypto = ["clever-emu-regs/crypto"] # X-crypto
+float = [
+    "clever-emu-primitives/float",
+    "clever-emu-errors/float",
+    "clever-emu-regs/float",
+    "clever-emu-decode/float",
+] # X-float
+vector = ["clever-emu-regs/vector", "clever-emu-decode/vector"] # X-vector
+float-ext = [
+    "float",
+    "clever-emu-regs/float-ext",
+    "clever-emu-decode/float-ext",
+] # X-float-ext
+rand = [
+    "clever-emu-regs/rand",
+    "clever-emu-decode/rand",
+    "dep:rand",
+    "dep:rand_chacha",
+] # X-rand
+hash-accel = [
+    "clever-emu-regs/hash-accel",
+    "clever-emu-decode/hash-accel",
+] # X-hash-accel
+crypto = ["clever-emu-regs/crypto", "clever-emu-decode/crypto"] # X-crypto
+debugging = []
+# multithreading = []

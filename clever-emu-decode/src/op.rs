@@ -39,7 +39,7 @@ def_enum! {
         Mul {size @ 2..4: SizeControl, supress_flags @ 0: bool} = 0o0006,
         Div {size @ 2..4: SizeControl, wide @ 1: bool, supress_flags @ 0: bool} = 0o0007,
 
-        Mov {} = 0o0010,
+        Mov {supress_flags @ 0: bool} = 0o0010,
         Lea {} = 0o0011,
         MovGpDst { dst @ 0..4 : CleverRegister} = 0o0012,
         MovGpSrc { src @ 0..4 : CleverRegister} = 0o0013,

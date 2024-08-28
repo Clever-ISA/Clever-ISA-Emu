@@ -31,6 +31,11 @@ pub struct SysMemory {
 }
 
 impl SysMemory {
+
+    pub fn new(page_limit: u32) -> Self{
+        Self{page_limit, page_count: SyncUnsafeCell::new(0), pages: RwLock::new(HashMap::new())}
+    }
+
     fn allocate_if_absent(&self, page: LeU32) -> Result<(), CacheAccessError> {
         let lock = self.pages.read();
 

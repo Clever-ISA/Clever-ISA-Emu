@@ -36,6 +36,7 @@ pub enum CPUException {
     PageFault(LeI64, FaultCharacteristics),
     ExecutionAlignment(LeI64),
     NonMaskableInterrupt,
+    DivideByZero,
     #[cfg(feature = "float")]
     FloatingPointException(FpException),
     Reset,
@@ -48,12 +49,25 @@ impl CPUException {
             | Self::Undefined
             | Self::NonMaskableInterrupt
             | Self::Reset
-            | Self::ExecutionAlignment(_) => None,
+            | Self::DivideByZero => None,
             Self::SystemProtection(code) => Some(*code),
-            Self::PageFault(addr, _) => Some(addr.cast_sign()),
+            Self::PageFault(addr, _) | Self::ExecutionAlignment(addr) => Some(addr.cast_sign()),
             #[cfg(feature = "float")]
             Self::FloatingPointException(fp) => Some(fp.bits().unsigned_as()),
         }
+    }
+
+    pub fn exception_num(&self) -> LeU8{
+        LeU8::new(match self{
+            Self::Reset | Self::Abort => 0,
+            Self::Undefined => 1,
+            Self::SystemProtection(_) => 2,
+            Self::PageFault(_, _) => 3,
+            Self::ExecutionAlignment(_) => 4,
+            Self::NonMaskableInterrupt => 5,
+            Self::DivideByZero => 6,
+            #[cfg(feature = "float")] Self::FloatingPointException(_) => 7,
+        })
     }
 }
 
