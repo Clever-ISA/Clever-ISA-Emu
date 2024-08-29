@@ -9,6 +9,9 @@ clever-emu-aci = { workspace = true, optional = true }
 clever-emu-wgpu = { workspace = true, optional = true }
 clever-emu-storage = { workspace = true, optional = true }
 clever-emu-mem.workspace = true
+clever-emu-types.workspace = true
+clever-emu-primitives.workspace = true
+bytemuck.workspace = true
 
 [features]
 float = ["clever-emu-cpu/float"]                       # X-float
@@ -25,7 +28,7 @@ storage = ["dep:clever-emu-storage"]
 iodma = ["storage", "clever-emu-storage/iodma"]
 spi = ["storage", "clever-emu-storage/spi"]
 # scsi = ["clever-emu-storage/sci"]
-ahci = ["storage", "clever-emu-storage/ahci"]
+# ahci = ["storage", "clever-emu-storage/ahci"]
 vhd = ["storage", "clever-emu-storage/vhd"]
-default = ["clever1.0", "aci", "wgpu", "iodma", "ahci", "vhd"]
+default = ["clever1.0", "aci", "wgpu", "iodma", "vhd", "spi"]
 # multithreading = ["clever-emu-cpu/multithreading"]

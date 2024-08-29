@@ -24,6 +24,10 @@ impl<M> SharedMemoryBus<M> {
             cache: Mutex::new(Cache::new(cache_size)),
         }
     }
+
+    pub fn inner(&self) -> &M {
+        &self.base
+    }
 }
 
 impl<M: CacheInvalidate> CacheInvalidate for SharedMemoryBus<M> {
@@ -107,6 +111,10 @@ impl<M> LocalMemoryBus<M> {
     pub fn invalidate_all_local(&self) {
         let mut lock = self.cache.borrow_mut();
         lock.invalidate_all_local()
+    }
+
+    pub fn inner(&self) -> &M {
+        &self.base
     }
 }
 
@@ -264,5 +272,5 @@ impl<M: CacheWrite> CacheWrite for LocalMemoryBus<M> {
     }
 }
 
-pub type GlobalMemory = SharedMemoryBus<SysMemory>;
+pub type GlobalMemory = SharedMemoryBus<Arc<SysMemory>>;
 pub type LocalMemory = LocalMemoryBus<Arc<GlobalMemory>>;

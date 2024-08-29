@@ -82,6 +82,12 @@ pub struct RootBridge {
     next_devid: u16,
 }
 
+impl Default for RootBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RootBridge {
     pub const fn new() -> Self {
         Self {
@@ -309,5 +315,5 @@ impl Device for RootBridge {
         }
     }
 
-    fn poll_interrupts(&self, port: &dyn DevicePort) {}
+    fn poll_interrupts(&self, _port: &dyn DevicePort) {}
 }

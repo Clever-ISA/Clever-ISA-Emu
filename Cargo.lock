@@ -270,10 +270,13 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 name = "clever-emu"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "clever-emu-aci",
  "clever-emu-cpu",
  "clever-emu-mem",
+ "clever-emu-primitives",
  "clever-emu-storage",
+ "clever-emu-types",
  "clever-emu-wgpu",
 ]
 
@@ -371,6 +374,7 @@ version = "0.1.0"
 dependencies = [
  "aci-firmware-hal",
  "aci-registry",
+ "bytemuck",
  "clever-emu-mem",
  "clever-emu-primitives",
  "clever-emu-types",
@@ -388,6 +392,8 @@ dependencies = [
 name = "clever-emu-wgpu"
 version = "0.1.0"
 dependencies = [
+ "aci-firmware-hal",
+ "aci-registry",
  "clever-emu-aci",
  "clever-emu-primitives",
  "wgpu",

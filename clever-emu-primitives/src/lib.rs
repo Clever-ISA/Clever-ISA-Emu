@@ -56,3 +56,33 @@ pub fn pod_align_to_mut<T: NoUninit + AnyBitPattern, U: NoUninit + AnyBitPattern
 ) -> (&mut [T], &mut [U], &mut [T]) {
     unsafe { x.align_to_mut() }
 }
+
+/// Returns the size of the type as a `u64`
+///
+/// ## Notes
+/// If we ever have a 128-bit usize, this function will staticaly error if `size_of::<T>()` exceeds the bounds of `u64`
+pub const fn size_of_as_u64<T>() -> u64 {
+    const {
+        let x = core::mem::size_of::<T>();
+
+        if x > (u64::MAX as usize) {
+            panic!("Size of a type exceeds u64::MAX (the future is now, thanks to science)")
+        }
+        x as u64
+    }
+}
+
+/// Returns the size of the type as an `i64`
+///
+/// ## Notes
+/// This function will staticaly error if `size_of::<T>()` exceeds the bounds of `i64`
+pub const fn size_of_as_i64<T>() -> i64 {
+    const {
+        let x = core::mem::size_of::<T>();
+
+        if x > (i64::MAX as usize) {
+            panic!("Size of a type exceeds i64::MAX")
+        }
+        x as i64
+    }
+}

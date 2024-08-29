@@ -24,6 +24,7 @@ pub trait IoPort {
     fn port_in(&self, addr: LeU64, size: SizeControl) -> LeU64;
 }
 
+#[derive(Default)]
 pub struct IoBus {
     ports: Vec<Arc<dyn IoPort + Sync>>,
     mmio: Vec<Arc<dyn MmioDevice + Sync>>,

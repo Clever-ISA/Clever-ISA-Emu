@@ -1,4 +1,5 @@
 mod emu_state_builder;
+mod serial;
 
 fn main() {
     let mut args = std::env::args();

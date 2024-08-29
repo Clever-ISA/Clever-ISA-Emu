@@ -3,7 +3,8 @@ use std::alloc::{alloc_zeroed, Layout};
 use std::cell::SyncUnsafeCell;
 use std::collections::HashMap;
 
-use bytemuck::Zeroable;
+use bytemuck::{Pod, Zeroable};
+use clever_emu_primitives::const_zeroed_safe;
 use clever_emu_primitives::primitive::{LeU32, LeU64};
 
 use parking_lot::RwLock;
@@ -11,12 +12,14 @@ use parking_lot_core::{park, unpark_filter, FilterOp, ParkToken, UnparkToken};
 
 use crate::cache::{CacheAccessError, CacheFetch, CacheInvalidate, CacheLine, CacheWrite, Status};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, Zeroable, Pod)]
 #[repr(C, align(4096))]
 pub struct Page([u8; 4096]);
 
 impl Page {
     pub const SIZE: i64 = core::mem::size_of::<Self>() as i64;
+
+    pub const ZERO_PAGE: &Page = &const_zeroed_safe();
 }
 
 #[derive(Debug)]
@@ -31,9 +34,12 @@ pub struct SysMemory {
 }
 
 impl SysMemory {
-
-    pub fn new(page_limit: u32) -> Self{
-        Self{page_limit, page_count: SyncUnsafeCell::new(0), pages: RwLock::new(HashMap::new())}
+    pub fn new(page_limit: u32) -> Self {
+        Self {
+            page_limit,
+            page_count: SyncUnsafeCell::new(0),
+            pages: RwLock::new(HashMap::new()),
+        }
     }
 
     fn allocate_if_absent(&self, page: LeU32) -> Result<(), CacheAccessError> {
@@ -63,6 +69,33 @@ impl SysMemory {
 
             Ok(())
         }
+    }
+
+    /// Directively accesses a given page by
+    pub fn with_page(&self, page: LeU32, f: impl FnOnce(&Page)) -> Result<(), CacheAccessError> {
+        self.allocate_if_absent(page)?;
+        let lock = self.pages.read();
+
+        let lock = lock[&page].read();
+
+        f(&lock);
+
+        Ok(())
+    }
+
+    pub fn with_page_mut(
+        &self,
+        page: LeU32,
+        f: impl FnOnce(&mut Page),
+    ) -> Result<(), CacheAccessError> {
+        self.allocate_if_absent(page)?;
+        let lock = self.pages.read();
+
+        let mut lock = lock[&page].write();
+
+        f(&mut lock);
+
+        Ok(())
     }
 }
 
