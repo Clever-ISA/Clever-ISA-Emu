@@ -4,7 +4,7 @@ use clever_emu_decode::{
     instr::{Instruction, Operand},
 };
 use clever_emu_errors::{AccessKind, CPUException, CPUResult, FaultCharacteristics, FaultStatus};
-use clever_emu_regs::{Flags, Mode, Regs};
+use clever_emu_regs::{Flags, Mode, PgTab, Regs};
 use clever_emu_types::{
     CleverRegister, CpuExecutionMode, Extension, ShiftSizeControl, SizeControl,
 };
@@ -20,7 +20,7 @@ use crate::{
 };
 use clever_emu_mem::{
     bus::{GlobalMemory, LocalMemory, LocalMemoryLockGuard},
-    cache::CacheLine,
+    cache::{CacheInvalidate, CacheLine},
     io::IoBus,
     phys::Page,
 };
@@ -59,32 +59,40 @@ pub struct CpuMemorySizes {
     pub __non_exhaustive: (),
 }
 
-impl Default for CpuMemorySizes {
-    #[cfg(not(target_pointer_width = "32"))]
-    fn default() -> Self {
-        Self {
-            sys_mem_size: 4096 * 4096 * 128,
-            l3size: 4096 * 1024,
-            l2size: 1024 * 1024,
-            l1dsize: 256 * 1024,
-            l1isize: 256 * 1024,
-            l1asize: 128 * 1024,
-            tlbsize: 512,
-            __non_exhaustive: (),
+impl CpuMemorySizes {
+    pub const fn new() -> Self {
+        #[cfg(not(target_pointer_width = "32"))]
+        {
+            Self {
+                sys_mem_size: 4096 * 4096 * 128,
+                l3size: 4096 * 1024,
+                l2size: 1024 * 1024,
+                l1dsize: 256 * 1024,
+                l1isize: 256 * 1024,
+                l1asize: 128 * 1024,
+                tlbsize: 512,
+                __non_exhaustive: (),
+            }
+        }
+        #[cfg(target_pointer_width = "32")]
+        {
+            Self {
+                sys_mem_size: 4096 * 4096 * 32,
+                l3size: 4096 * 1024,
+                l2size: 1024 * 1024,
+                l1dsize: 256 * 1024,
+                l1isize: 256 * 1024,
+                l1asize: 128 * 1024,
+                tlbsize: 512,
+                __non_exhaustive: (),
+            }
         }
     }
-    #[cfg(target_pointer_width = "32")]
+}
+
+impl Default for CpuMemorySizes {
     fn default() -> Self {
-        Self {
-            sys_mem_size: 4096 * 4096 * 32,
-            l3size: 4096 * 1024,
-            l2size: 1024 * 1024,
-            l1dsize: 256 * 1024,
-            l1isize: 256 * 1024,
-            l1asize: 128 * 1024,
-            tlbsize: 512,
-            __non_exhaustive: (),
-        }
+        Self::new()
     }
 }
 
@@ -175,6 +183,26 @@ impl Cpu {
             rand_dev: rand_chacha::ChaCha20Rng::from_rng(thread_rng())
                 .expect("We should be able to seed the generator"),
         }
+    }
+
+    pub fn init(&mut self) {
+        self.fetch_ip.set(LeI64::new(0xff00));
+        self.regs.ip = LeI64::new(0xFF00);
+        self.regs.mode = Mode::empty();
+        #[cfg(feature = "float")]
+        {
+            self.regs.fpcw = clever_emu_regs::Fpcw::empty();
+        }
+
+        unsafe {
+            self.regs.array[0x80..0x88].fill(LeU64::new(0));
+        }
+
+        self.l2cache.invalidate_all();
+        self.addr_resolver.set_cr3(PgTab::empty());
+        self.l1dcache.flush_all();
+        self.l1icache
+            .reposition_after_mode_switch(LeU64::new(0xFF00));
     }
 
     pub fn enabled(&self) -> bool {
@@ -1029,7 +1057,9 @@ impl Cpu {
     }
 
     pub fn tick(&mut self) -> CPUResult<()> {
-        match self.as_instruction_stream().fetch::<Instruction>()? {
+        eprintln!("IP: {:#X}", self.fetch_ip.get());
+        let instr = self.as_instruction_stream().fetch::<Instruction>()?;
+        match dbg!(instr) {
             Instruction::Und(_) | Instruction::UndFFF(_) => Err(CPUException::Undefined)?,
             Instruction::Add(h, dest, src) => {
                 self.check_wf(&dest)?;
@@ -1228,7 +1258,7 @@ impl Cpu {
 
                 self.regs.flags.set_parity(true);
             }
-            _ => Err(CPUException::Undefined)?,
+            instr => todo!("{instr:?}"),
         }
 
         self.regs.ip = self.fetch_ip.get();

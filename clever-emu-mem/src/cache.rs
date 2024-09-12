@@ -314,7 +314,7 @@ impl CacheLine {
 #[repr(C, align(8))]
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, Pod, Zeroable)]
 pub struct CacheAttrs {
-    seq_lock: LeU64,
+    pub(crate) seq_lock: LeU64,
 }
 
 impl CacheAttrs {

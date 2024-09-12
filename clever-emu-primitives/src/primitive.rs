@@ -809,7 +809,7 @@ impl_le_integers_unsigned_as_truncate! {
 }
 
 def_fix_endian_integers! {
-    order big (from_le_bytes: to_le_bytes, from_be_bytes: to_be_bytes);
+    order big (from_be_bytes: to_be_bytes, from_le_bytes: to_le_bytes);
     pub type BeI8 = i8;
     pub type BeU8 = u8;
     pub type BeI16 = i16;

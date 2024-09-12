@@ -209,7 +209,6 @@ impl InstrCache {
         let fetch_buffer = unsafe { &mut *self.fetch_buffer.get() };
         fetch_buffer.offset = !0;
 
-        
         let offset = (new_ip & (CacheLine::SIZE - 1)).get() as usize;
         let line_addr = new_ip & !(CacheLine::SIZE - 1);
 
@@ -252,6 +251,7 @@ impl InstrCache {
         let fetch_buffer = unsafe { &mut *self.fetch_buffer.get() };
 
         let word = fetch_buffer.line[fetch_buffer.offset];
+        eprintln!("Fetched: {word:#06x}");
         fetch_buffer.offset += 1;
         if fetch_buffer.offset == core::mem::size_of::<CacheLine>() >> 1 {
             fetch_buffer.offset = 0;

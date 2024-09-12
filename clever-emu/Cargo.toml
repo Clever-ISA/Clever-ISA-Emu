@@ -12,6 +12,7 @@ clever-emu-mem.workspace = true
 clever-emu-types.workspace = true
 clever-emu-primitives.workspace = true
 bytemuck.workspace = true
+nonzero = "0.2.0"
 
 [features]
 float = ["clever-emu-cpu/float"]                       # X-float

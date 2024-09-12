@@ -72,15 +72,14 @@ fn process_exceptions(cpu: &mut Cpu, f: impl FnOnce(&mut Cpu) -> CPUResult<()>) 
 
 impl CpuExecutor {
     #[cfg(not(feature = "multithreading"))]
-    pub fn new(num_cpus: NonZero<usize>, memory_sizes: CpuMemorySizes, iobus: IoBus) -> Self {
-        let sys_mem = SysMemory::new(
-            (memory_sizes.sys_mem_size / (Page::SIZE as usize))
-                .try_into()
-                .expect("The maximum size of system memory is 16TiB (16384 GiB)"),
-        );
-
+    pub fn new(
+        num_cpus: NonZero<usize>,
+        memory_sizes: CpuMemorySizes,
+        sys_memory: Arc<SysMemory>,
+        iobus: IoBus,
+    ) -> Self {
         let l3cache = Arc::new(GlobalMemory::new(
-            Arc::new(sys_mem),
+            sys_memory,
             memory_sizes.l3size / (CacheLine::SIZE as usize),
         ));
 
@@ -100,6 +99,12 @@ impl CpuExecutor {
 
     pub fn global_memory(&self) -> &GlobalMemory {
         &self.l3cache
+    }
+
+    pub fn init(&mut self) {
+        for cpu in &mut self.cpus {
+            cpu.init();
+        }
     }
 
     pub fn run(&mut self) -> CPUResult<()> {

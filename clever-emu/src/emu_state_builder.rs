@@ -1,18 +1,32 @@
 use std::{
     ffi::OsStr,
-    io,
+    fs,
+    io::{self, Read},
+    num::NonZero,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 #[cfg(feature = "aci")]
 use clever_emu_aci::root::RootBridge;
-use clever_emu_cpu::cpu::CpuMemorySizes;
-use clever_emu_mem::io::IoBus;
+use clever_emu_cpu::{
+    cpu::{Cpu, CpuMemorySizes},
+    executor::CpuExecutor,
+};
+use clever_emu_mem::{
+    io::IoBus,
+    phys::{Page, SysMemory},
+};
+use clever_emu_primitives::{
+    nzlit,
+    primitive::{LeU32, LeU64},
+    size_of_as_u64,
+};
 #[cfg(feature = "iodma")]
 use clever_emu_storage::interface::iodma::InterfaceIodma;
 #[cfg(feature = "spi")]
 use clever_emu_storage::interface::spi::SpiController;
-use clever_emu_storage::store::{DirectStorage, Storage, StorageMode};
+use clever_emu_storage::store::{DirectStorage, StorageMode};
 #[cfg(feature = "wgpu")]
 use clever_emu_wgpu::device::WgpuDevice;
 
@@ -22,8 +36,6 @@ use crate::serial::SerialDevice;
 pub struct EmuStateBuilder {
     #[cfg(feature = "aci")]
     root_bridge: RootBridge,
-    #[cfg(feature = "wgpu-shaders")]
-    wpgu_shaders: bool,
     #[cfg(feature = "iodma")]
     iodma_bus: InterfaceIodma,
     #[cfg(feature = "spi")]
@@ -31,9 +43,29 @@ pub struct EmuStateBuilder {
     cpu_memory_sizes: CpuMemorySizes,
     firmware_path: Option<PathBuf>,
     iobus: IoBus,
+    num_cpus: Option<NonZero<usize>>,
 }
 
 impl EmuStateBuilder {
+    pub const fn new() -> EmuStateBuilder {
+        EmuStateBuilder {
+            cpu_memory_sizes: CpuMemorySizes::new(),
+            num_cpus: None,
+            firmware_path: None,
+            iobus: IoBus::new(),
+            #[cfg(feature = "aci")]
+            root_bridge: RootBridge::new(),
+            #[cfg(feature = "iodma")]
+            iodma_bus: InterfaceIodma::new(),
+            #[cfg(feature = "spi")]
+            spi_controller: SpiController::new(),
+        }
+    }
+
+    pub fn firmware(&mut self, path: PathBuf) {
+        self.firmware_path = Some(path);
+    }
+
     pub fn attach_serial(&mut self, file: &str) -> io::Result<()> {
         let (mode, file) = file
             .split_once(":")
@@ -130,5 +162,57 @@ impl EmuStateBuilder {
             ))?,
         }
         Ok(())
+    }
+
+    pub fn create_executor(mut self) -> io::Result<CpuExecutor> {
+        let sysmem = Arc::new(SysMemory::new(
+            (self.cpu_memory_sizes.sys_mem_size / size_of::<Page>()) as u32,
+        ));
+
+        let mut firmware = fs::File::open(
+            self.firmware_path
+                .as_deref()
+                .unwrap_or_else(|| Path::new("bios")),
+        )?;
+
+        for i in 0..16 {
+            sysmem
+                .with_page_mut(LeU32::new(i), |page| {
+                    firmware.read_exact(bytemuck::bytes_of_mut(page))
+                })
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "Invalid value for {} - must be at least 64k to load the bios",
+                            self.cpu_memory_sizes.sys_mem_size
+                        ),
+                    )
+                })??;
+        }
+
+        #[cfg(feature = "iodma")]
+        {
+            self.iodma_bus.set_memory_bus(Arc::clone(&sysmem));
+            self.iobus.attach_port(self.iodma_bus);
+        }
+
+        #[cfg(feature = "aci")]
+        {
+            let root_bridge = Arc::new(self.root_bridge);
+
+            self.iobus
+                .attach_shared_port(Arc::<RootBridge>::clone(&root_bridge));
+            self.iobus.attach_shared_mmio(root_bridge);
+        }
+
+        Ok(CpuExecutor::new(
+            self.num_cpus
+                .or_else(|| std::thread::available_parallelism().ok())
+                .unwrap_or(nzlit!(1)),
+            self.cpu_memory_sizes,
+            sysmem,
+            self.iobus,
+        ))
     }
 }

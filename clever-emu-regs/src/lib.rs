@@ -1,5 +1,7 @@
 pub mod cpuid;
 
+use std::slice::SliceIndex;
+
 use bytemuck::{Pod, Zeroable};
 
 use clever_emu_primitives::{bitfield, bitfield::BitfieldArray, le_fake_enum, primitive::*};
@@ -344,7 +346,7 @@ pub struct NamedRegs {
 safe_union! {
     pub union Regs{
         pub named: NamedRegs,
-        array: [LeU64;256]
+        pub array: [LeU64;256]
     }
 }
 

@@ -71,6 +71,7 @@ macro_rules! encoded_enum {
 encoded_enum! {
     use OperandCs::*;
     pub enum Operand : OperandCs{
+        #![derive(Debug)]
         Register(),
         Indirect(),
         SmallImm(),
@@ -81,6 +82,8 @@ encoded_enum! {
 impl FromInstructionStream<()> for Operand {
     fn decode<I: InstructionStream>(stream: &mut I, _: ()) -> CPUResult<Self> {
         let cs = OperandCs::decode(stream, ())?;
+
+        eprintln!("Decoded {cs:?}");
 
         <Self as FromInstructionStream<OperandCs>>::decode(stream, cs)
     }
@@ -93,6 +96,7 @@ use crate::op::uncond_branch_opcode_bits::*;
 encoded_enum! {
     use crate::op::UncondBranchOpcode::*;
     pub enum UncondBranchInstruction : UncondBranchOpcode {
+        #![derive(Debug)]
         Jmp(WideInt),
         Call(WideInt),
         Fcall(WideInt),
@@ -117,6 +121,7 @@ encoded_enum! {
 
     pub enum Instruction : InstructionOpcode{
         #![non_exhaustive]
+        #![derive(Debug)]
         (NonBranch) Und (),
         (NonBranch) Add(Operand, Operand),
         (NonBranch) Sub(Operand, Operand),

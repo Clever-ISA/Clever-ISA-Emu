@@ -2,6 +2,7 @@ use std::alloc::{alloc_zeroed, Layout};
 
 use std::cell::SyncUnsafeCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytemuck::{Pod, Zeroable};
 use clever_emu_primitives::const_zeroed_safe;
@@ -10,7 +11,9 @@ use clever_emu_primitives::primitive::{LeU32, LeU64};
 use parking_lot::RwLock;
 use parking_lot_core::{park, unpark_filter, FilterOp, ParkToken, UnparkToken};
 
-use crate::cache::{CacheAccessError, CacheFetch, CacheInvalidate, CacheLine, CacheWrite, Status};
+use crate::cache::{
+    CacheAccessError, CacheAttrs, CacheFetch, CacheInvalidate, CacheLine, CacheWrite, Status,
+};
 
 #[derive(Debug, Clone, Copy, Zeroable, Pod)]
 #[repr(C, align(4096))]
@@ -31,6 +34,8 @@ pub struct SysMemory {
     // It is sound to perform write accesses to this cell from a thread that owns the excusive write lock to `pages`
     page_count: SyncUnsafeCell<u32>,
     pages: RwLock<HashMap<LeU32, RwLock<Box<Page>>>>,
+    seq_lock_seed: LeU64,
+    seq_lock_counter: AtomicUsize,
 }
 
 impl SysMemory {
@@ -39,6 +44,8 @@ impl SysMemory {
             page_limit,
             page_count: SyncUnsafeCell::new(0),
             pages: RwLock::new(HashMap::new()),
+            seq_lock_seed: LeU64::new(rand::random()),
+            seq_lock_counter: AtomicUsize::new(0),
         }
     }
 
@@ -72,30 +79,30 @@ impl SysMemory {
     }
 
     /// Directively accesses a given page by
-    pub fn with_page(&self, page: LeU32, f: impl FnOnce(&Page)) -> Result<(), CacheAccessError> {
+    pub fn with_page<R>(
+        &self,
+        page: LeU32,
+        f: impl FnOnce(&Page) -> R,
+    ) -> Result<R, CacheAccessError> {
         self.allocate_if_absent(page)?;
         let lock = self.pages.read();
 
         let lock = lock[&page].read();
 
-        f(&lock);
-
-        Ok(())
+        Ok(f(&lock))
     }
 
-    pub fn with_page_mut(
+    pub fn with_page_mut<R>(
         &self,
         page: LeU32,
-        f: impl FnOnce(&mut Page),
-    ) -> Result<(), CacheAccessError> {
+        f: impl FnOnce(&mut Page) -> R,
+    ) -> Result<R, CacheAccessError> {
         self.allocate_if_absent(page)?;
         let lock = self.pages.read();
 
         let mut lock = lock[&page].write();
 
-        f(&mut lock);
-
-        Ok(())
+        Ok(f(&mut lock))
     }
 }
 
@@ -114,12 +121,21 @@ impl CacheFetch for SysMemory {
         &self,
         line: LeU64,
     ) -> crate::cache::CacheAccessResult<crate::cache::CacheAttrs> {
-        todo!()
+        let ctr = self.seq_lock_counter.fetch_add(1, Ordering::Relaxed) as u64;
+        Ok((
+            CacheAttrs {
+                seq_lock: ((line ^ self.seq_lock_seed) + ctr) << 6,
+            },
+            Status::Hit,
+        ))
     }
 
     fn read_line(&self, line: LeU64) -> crate::cache::CacheAccessResult<crate::cache::CacheLine> {
         let page = (line >> 12).truncate_to();
-        let page_offset = (line & 0x3C0).get() as usize;
+        let page_offset = (line & 0xFC0).get() as usize;
+
+        eprintln!("Page: {page}");
+        eprintln!("Offset in Page: {page_offset:#05x}");
 
         self.allocate_if_absent(page)?;
         let lock = self.pages.read();

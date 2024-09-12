@@ -8,17 +8,23 @@ LD := $(TARGET)-ld
 OBJCOPY := $(TARGET)-objcopy
 STRIP := $(TARGET)-strip
 
-MBR_OBJS = 
+MBR_OBJS = mbr/main.o
 
 STAGE2_OBJS = 
 
-MBR_OUTPUT = 
+MBR_OUTPUT = boot-mbr
 
-STAGE2_OUTPUT = 
+STAGE2_OUTPUT = boot-stage2
+
+OUTPUTS = $(MBR_OUTPUT)
+
+ifndef DISABLE_STAGE2
+	OUTPUTS += $(STAGE2_OUTPUT)
+endif
 
 all: stamp
 
-stamp: $(MBR_OUTPUT) $(STAGE2_OUTPUT)
+stamp: $(OUTPUTS)
 	touch stamp
 
 $(MBR_OUTPUT): $(MBR_OUTPUT).elf $(MBR_OUTPUT).dbg

@@ -28,10 +28,12 @@ pub trait FromInstructionStream<Ctx>: Sized {
 
 impl<B, Ctx> FromInstructionStream<Ctx> for B
 where
-    B: FromBitfield<BeU16> + Copy,
+    B: FromBitfield<BeU16> + Copy + core::fmt::Debug,
 {
     fn decode<I: InstructionStream>(stream: &mut I, _: Ctx) -> CPUResult<Self> {
         let val = B::from_bits(stream.next_iword()?);
+
+        eprintln!("{:x?}", val);
 
         if val.validate() {
             Ok(val)
@@ -57,7 +59,43 @@ impl<C: NoContext> AsDecodeContext for C {
 }
 
 #[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct WideInt(pub LeU128);
+
+impl core::fmt::Debug for WideInt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl core::fmt::Display for WideInt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl core::fmt::LowerHex for WideInt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl core::fmt::UpperHex for WideInt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl core::fmt::Octal for WideInt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl core::fmt::Binary for WideInt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 impl FromInstructionStream<ShiftSizeControl> for WideInt {
     fn decode<I: InstructionStream>(stream: &mut I, ctx: ShiftSizeControl) -> CPUResult<Self> {

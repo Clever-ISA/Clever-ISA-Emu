@@ -86,3 +86,18 @@ pub const fn size_of_as_i64<T>() -> i64 {
         x as i64
     }
 }
+
+#[macro_export]
+macro_rules! nzlit{
+    ($lit:literal) => {
+        const {
+            let val = $lit;
+
+            if val == 0{
+                panic!("Literla zero is not allowed for `nzlit")
+            }
+
+            unsafe { ::core::num::NonZero::new_unchecked(val) }
+        }
+    };
+}

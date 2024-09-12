@@ -17,7 +17,7 @@ macro_rules! bitfield{
 
         $(#[$meta])*
         $(#[$struct_meta])*
-        #[derive(Copy, Clone, PartialEq, Eq, Hash, Default, Debug, $crate::bitfield::__exports::Zeroable, $crate::bitfield::__exports::Pod)]
+        #[derive(Copy, Clone, PartialEq, Eq, Hash, Default, $crate::bitfield::__exports::Zeroable, $crate::bitfield::__exports::Pod)]
         #[repr(transparent)]
         $vis struct $bitfield_ty{__bits: $base_ty}
 
@@ -182,6 +182,33 @@ macro_rules! bitfield{
                 )*
 
                 Ok(())
+            }
+        }
+
+        $(#[$meta])*
+        impl ::core::fmt::Debug for $bitfield_ty{
+            fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result{
+                let mut debug_struct = f.debug_struct(::core::stringify!($bitfield_ty));
+                let mut mask = <$base_ty>::new(0);
+                $(
+                    $(#[$meta2])*
+                    {
+                        let placement = $placement_start $(.. $placement_end)?;
+                        mask = $crate::bitfield::BitfieldPosition::insert(&placement, mask, <$base_ty>::new(!0));
+                        let val = self.$field_name();
+                        debug_struct.field(::core::stringify!($field_name), &val);
+                    }
+                )*
+
+                let bits = self.__bits;
+
+                let garbage = bits & !mask;
+
+                if garbage != 0{
+                    debug_struct.field("{garbage}", &::core::format_args!("{garbage:#6x}"));
+                }
+
+                debug_struct.finish()
             }
         }
 
